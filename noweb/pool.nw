@@ -1,0 +1,210 @@
+@ \section{Fixed-size memory pools}\label{section:pools}
+The C standard library implements a general-purpose memory management scheme
+capable of allocating objects of any size. By furthermore requiring each
+invocation of [[malloc]] or [[calloc]] to have a corresponding call to
+[[free]], object lifetimes are similarly unconstrained as well. Though suitable
+for any use case, this generality comes at a performance cost. Besides being
+prone to fragmentation, allocations require a linear search through a linked
+list of memory blocks for free space large enough to serve the request. These
+shortcomings become particularly apparent when a large number of relatively 
+small short-lived objects must be created, happening to be the primary use case
+for the program under consideration. Various alternative solutions to dynamic
+memory management have been explored, however, that sacrifice generality in
+exchange for performance. For our own purposes, it turns out that a simple
+solution described by Knuth \cite{knuth1997} suffices. Specifically, since we
+shall find occasion to allocate objects of but three different sizes on the
+heap, we can do so using separate dedicated memory pools. Each serves requests
+for only a single size, eliminating fragmentation entirely and making it
+possible to implement constant time allocation. Object lifetimes, on the other
+hand, we shall want to keep unconstrained, thus still requiring each object to
+be freed individually. This contrasts with, e.g., the concept of an arena used
+by Fraser and Hanson \cite{fraser1995}, \cite{hanson1996}, whereby
+deallocations are performed in batches. Such is possible only whenever one's
+objects form natural groupings in terms of their lifetimes, however, which
+did not consistently apply in our own case.
+
+\subsection{Interface}
+A memory pool enables constant-time allocation and deallocation for objects of
+a fixed size.
+
+<<pool.h>>=
+#ifndef POOL_H_
+#define POOL_H_
+
+#include <stddef.h>
+
+#include "node.h"
+
+<<pool.h macros>>
+<<pool.h constants>>
+<<pool.h typedefs>>
+<<pool.h variable declarations>>
+<<pool.h function prototypes>>
+
+#endif /* POOL_H_ */
+
+@ The size of the objects served by a given memory pool is recorded as part of
+its definition. The C standard library exports an unsigned integral type
+[[size_t]] large enough to hold the size of any object, being perfectly suited
+to our purposes.
+
+<<pool.h typedefs>>=
+typedef struct {
+  size_t        size;
+  <<pool\_t fields>>
+} pool_t;
+
+@ A memory pool allocates its objects from a byte array that we shall set
+aside for it at compile time, offering a fixed capacity that is a multiple of
+[[size]]. The fields [[start]] and [[limit]] delimit the array, pointing at its
+first byte, resp. one beyond the last. Finally, [[max]] points at the next
+allocable byte, its distance from [[start]] again always being a multiple of
+[[size]].
+
+<<pool\_t fields>>=
+char * const  start;
+char * const  limit;
+char *        max;
+@
+If the lifetimes of all our objects always adhered to last-in first-out, we
+would be done: [[max]] could be incremented for every allocation, and
+decremented again upon a deallocation. Rarely is memory management so simple,
+however, and our situation is no exception. To enable deallocation without
+restrictions, we will maintain a separate linked list of available free
+objects. Releasing an object will simply put it at the head, whereas
+allocation will first try to take an object from the list before resorting to
+incrementing [[max]]. The free list itself may be typed simply using
+[[node_t]], as all objects whose allocation we shall want to manage using a
+pool will extend therefrom.
+
+<<pool\_t fields>>=
+node_t *      avail;
+@
+We will need a total of three memory pools for serving allocation requests,
+which we shall globally declare here together. Our reasons for exporting their
+identities like so are primarily due to enable proper exception handling.
+Specifically, if we end up running out of memory in one pool, we shall recover
+by releasing all resources held by every pool before allowing the user to
+try inputting another term through the REPL.
+
+<<pool.h variable declarations>>=
+extern pool_t   g_ast_pool;
+extern pool_t   g_env_pool;
+extern pool_t   g_symbol_pool;
+
+@ Pools are always initialized the same way, suggesting the use of a macro. We
+require the type of objects being served, allowing to deduce their size, as
+well as a reference to a backing array together with its capacity.
+
+<<pool.h macros>>=
+#define INIT_POOL(pool, elems, type) {              \
+  sizeof(type),                       /* size */    \
+  (char * const)(pool),               /* start */   \
+  (char * const)((pool) + (elems)),   /* limit */   \
+  (char *)(pool),                     /* max */     \
+  NULL                                /* avail */   \
+}
+
+@ In practice, we shall use the same number of elements for every array backing
+a memory pool, defining it here once by a constant.
+
+<<pool.h constants>>=
+enum {
+  N_ELEMS = 1024
+};
+
+@ Similarly to the standard library, two methods are exported for memory
+allocation. The objects returned by the first, [[Pool_Alloc]], may contain
+garbage, whereas those returned by [[Pool_Calloc]] have all their bits set to
+$0$. Note that in both cases we return a void pointer, enabling implicit casts
+to any type of struct extending [[node_t]].
+
+<<pool.h function prototypes>>=
+extern void *   Pool_Alloc(pool_t * const);
+extern void *   Pool_Calloc(pool_t * const);
+@
+Allocated objects may be individually released using [[Pool_Free]], similarly
+to the standard library's [[free]]. In addition, we also allow for entire lists
+to be freed at once using [[Pool_FreeList]].
+
+<<pool.h macros>>=
+#define Pool_Free(me, item)       Push(&(me)->avail, (item))
+#define Pool_FreeList(me, item)   Append(&(me)->avail, (item))
+
+@ Finally, a memory pool can be cleared in the sense of having all its memory
+released. This invalidates all objects previously allocated from it that had
+not yet been freed, placing the responsibility with the client to no longer
+refer to them. In practice, we shall only use this method for recovering from
+out of memory exceptions.
+
+<<pool.h function prototypes>>=
+extern void     Pool_Clear(pool_t * const);
+@
+\subsection{Implementation}
+As with cyclic linked lists, so our implementation of memory pools is based
+largely on Knuth \cite{knuth1997}.
+
+<<pool.c>>=
+#include "pool.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "except.h"
+#include "node.h"
+
+<<pool.c function definitions>>
+
+@ We first try to satisfy allocation requests from the list of available freed
+objects. Only if the latter is empty do we attempt to retrieve the required
+space from the backing array by incrementing [[max]]. Finally, if that fails as
+well, we print a message and raise an exception.
+
+<<pool.c function definitions>>=
+void *
+Pool_Alloc(pool_t * const me)
+{
+  assert(me);
+
+  if ((me->avail)) {
+    return Pop(&me->avail);
+  }
+  if (me->max < me->limit) {
+    me->max += me->size;
+    assert(me->max <= me->limit);
+    return me->max - me->size;
+  }
+  fprintf(stderr, "Out of memory.\n");
+  THROW;
+}
+
+@ [[Pool_Calloc]] works the same as [[Pool_Alloc]], except that it will always
+clear all bits of an object before returning it to the caller.
+
+<<pool.c function definitions>>=
+void *
+Pool_Calloc(pool_t * const me)
+{
+  void *  ptr;
+
+  assert(me);
+
+  ptr = Pool_Alloc(me);
+  memset(ptr, 0, me->size);
+  return ptr;
+}
+
+@ Releasing all memory held by a memory pool is as easy as emptying the list
+of freed objects, and resetting [[max]] to the start of the backing array.
+
+<<pool.c function definitions>>=
+void
+Pool_Clear(pool_t * const me)
+{
+  assert(me);
+
+  me->avail = NULL;
+  me->max = (char *)me->start;
+}

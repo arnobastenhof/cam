@@ -1,0 +1,39 @@
+\documentclass{book}
+
+\usepackage{cite}
+\usepackage{noweb}
+\usepackage{tikz}
+\usepackage{tikz-qtree}
+
+% http://tex.stackexchange.com/a/50355
+\newcommand\T{\rule{0pt}{2.6ex}}       % Top strut
+\newcommand\B{\rule[-1.2ex]{0pt}{0pt}} % Bottom strut
+
+\pagestyle{noweb}
+\bibliographystyle{plain}
+
+\begin{document}
+
+\title{A literate implementation in C of the Categorical Abstract Machine}
+\author{Arno Bastenhof}
+\date{\today}
+\maketitle
+
+\tableofcontents
+
+\noweboptions{externalindex}
+
+\include{intro}
+\include{node}
+\include{except}
+\include{pool}
+\include{ast}
+\include{env}
+\include{cam}
+\include{optim}
+\include{lexer}
+\include{parser}
+\include{main}
+
+\bibliography{../../book}
+\end{document}

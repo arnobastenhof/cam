@@ -1,0 +1,359 @@
+@ \section{Optimization}\label{section:optim}
+Our discussion so far emphasized $\lambda$-terms as a notational device for
+unifying various algebraic modes of expression adopted across different
+branches of mathematics and computer science, furthermore explaining how they
+could be evaluated to the objects of a scientist's domain of discourse, like
+numbers. Quite another perspective exists as to their utility, however, viewing
+them as a means of performing arbitrary calculations. Backed by a system of
+rewriting rules, they enable a model of computation equivalent to that
+embodied by Turing Machines; a result that would form the foundation for the
+Church-Turing thesis.
+
+Our goals for this section are not to develop the full theory of term rewriting
+in its applications to the $\lambda$-calculus, but rather to motivate it
+briefly and show how its results can be used for the purpose of developing
+optimization passes over AST's prior to their evaluation, developing an idea
+in Cousinea et al. \cite{cousineau1985}. To start with a concrete example,
+consider the following definitional equation:
+\begin{center}
+$x + 2 \ \textbf{where} \ x = 1$
+\end{center}
+In $\lambda$-calculus, we may alternatively render this expression by the term
+$((\lambda x.(+ \ x \ 2)) \ 1)$. It should be clear, intuitively, that the 
+latter does not differ in its meaning from the result of substituting $1$ for
+$x$ in $(+ \ x \ 2)$, i.e., $(+ \ 1 \ 2)$. To generalize this result, as well
+as making it more explicit, consider the AST $\textit{App}\circ\langle
+\Lambda(f),g\rangle$ for the application of an abstraction to some argument.
+Applied to a context $\Gamma$, we obtain the following sequence of computations
+\begin{itemize}
+\item[] $(\textit{App}\circ\langle\Lambda(f),g\rangle)(\Gamma)$
+\item[$=$] $\textit{App}(\langle\Lambda(f),g\rangle(\Gamma))$
+\item[$=$] $\textit{App}(\langle\Lambda(f)(\Gamma),g(\Gamma)\rangle)$
+\item[$=$] $\Lambda(f)(\Gamma)(g(\Gamma))$
+\item[$=$] $f(\Gamma, g(\Gamma))$.
+\end{itemize}
+motivating the `equivalence' of our original term $\textit{App}\circ\langle
+\Lambda(f),g\rangle$ and $f\circ\langle\textit{Id},g\rangle$. By a similar
+line of reasoning, we can infer $\textit{Fst}\circ\langle f,g\rangle$ may
+always be replaced by $f$, and $\textit{Snd}\circ\langle f,g\rangle$ by $g$.
+More such equivalences exist, and their systematic study is a cornerstone of
+category theory. When related specifically to $\lambda$-terms, they bear
+similarity to calculi of explicit substitutions, as has been explored, among
+others, by Curien \cite{curien1985}, and, though never stated there explicitly,
+also always being felt throughout De Bruijn's \cite{debruijn1972} exposition of
+his nameless notation. As for the current work, we shall not dive any deeper
+into such matters than we already have, and will rather limit ourselves to
+only the three equivalences motivated above, showing how we can implement
+optimization passes therewith.
+
+\subsection{Interface}
+We implement our optimizer as a treewalk over an AST, leaving the latter
+unmodified while producing an entirely new copy.
+
+<<optim.h>>=
+#ifndef OPTIM_H_
+#define OPTIM_H_
+
+#include "ast.h"
+
+<<optim.h typedefs>>
+<<optim.h function prototypes>>
+
+#endif /* OPTIM_H_ */
+
+@ During an optimization pass, we keep track in a variable [[cnt]] of the
+number of transformations that were applied, allowing us later to apply
+multiple passes in iteration until no more changes were made. In addition, we
+will maintain a stack of freshly allocated nodes satisfying the invariant that
+during a postvisit of some $f$, repeatedly popping the stack will produce the
+AST's built during the traversals of $f$'s children in right-to-left order,
+followed by a copy made of their parent node during the latter's previsit.
+These components we can then combine into an AST representing the result of
+optimizing $f$ as a whole, which we then push back on the stack.
+ 
+<<optim.h typedefs>>=
+typedef struct {
+  visit_t   base;
+  node_t *  stack;
+  int       cnt;
+} optim_t;
+
+@ Like instances of our evaluator, those of our optimizers are allocated only
+on the stack, requiring separate initialization. While heap-allocated resources
+\'are acquired during the operation of an optimizer, all these are accessible
+afterwards as part of the AST remaining (alone) on the optimizer's stack. As
+such, we do not require an additional cleanup method, seeing as we would rather
+keep our results for further processing as opposed to immediately disposing of
+them again.
+
+<<optim.h function prototypes>>=
+extern void Optim_Init(optim_t * const);
+@
+\subsection{Implementation}
+
+<<optim.c>>=
+#include "optim.h"
+
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "pool.h"
+
+<<optim.c function prototypes>>
+<<optim.c function definitions>>
+
+@ Being implemented as a walker, the algorithm applied by the optimizer is
+distributed over its visitor methods. Notice, again, the mismatch in method
+signatures with respect to the type declared for the first argument when
+compared to the definition of [[visitFunc_t]]. Given that every [[optim_t]]
+`is a' [[visitor_t]], however, we can safely resolve the matter later on using
+explicit casts.
+
+<<optim.c function prototypes>>=
+static statusCode_t PreVisitParent(optim_t * const, const ast_t *);
+static statusCode_t PostVisitParent(optim_t * const, const ast_t *);
+static statusCode_t VisitLeaf(optim_t * const, const ast_t *);
+static statusCode_t VisitFst(optim_t * const, const ast_t *);
+static statusCode_t VisitSnd(optim_t * const, const ast_t *);
+static statusCode_t VisitApp(optim_t * const, const ast_t *);
+
+@ Again similar to our prior exposition of the CAM, we initialize an optimizer
+pass by setting the virtual function table as well as its count and stack.
+
+<<optim.c function definitions>>=
+void
+Optim_Init(optim_t * const me)
+{
+  <<define optimizer virtual function table [[vtbl]]>>
+
+  assert(me);
+
+  me->stack = NULL;
+  me->cnt = 0;
+  me->base.vptr = &vtbl;
+}
+
+@ The virtual function table is again shared between different optimizer
+instances.
+
+<<define optimizer virtual function table [[vtbl]]>>=
+static const visitVtbl_t vtbl = {
+  (visitFunc_t) VisitLeaf,        /* VisitId */
+  (visitFunc_t) VisitApp,         /* VisitApp */
+  (visitFunc_t) VisitLeaf,        /* VisitQuote */
+  (visitFunc_t) VisitLeaf,        /* VisitPlus */
+  (visitFunc_t) VisitFst,         /* VisitFst */
+  (visitFunc_t) VisitSnd,         /* VisitSnd */
+  (visitFunc_t) PreVisitParent,   /* PreVisitComp */
+  (visitFunc_t) PreVisitParent,   /* PreVisitPair */
+  (visitFunc_t) PreVisitParent,   /* PreVisitCur */
+                VisitDefault,     /* InVisitPair */
+  (visitFunc_t) PostVisitParent,  /* PostVisitComp */
+  (visitFunc_t) PostVisitParent,  /* PostVisitPair */
+  (visitFunc_t) PostVisitParent   /* PostVisitCur */
+};
+@
+When popping nodes off the optimizer's stack, how do we tell siblings from
+their parent? We must clearly mark the latter, and we do so by making it its
+own parent. Indeed, while created during a node's previsit, we won't set
+its children until the postvisit, guaranteeing [[rchild]] isn't being used
+anyway until then.
+
+<<optim.c function definitions>>=
+static inline bool
+IsSibling(const ast_t * const ap)
+{
+  return ap->rchild != ap;
+}
+
+@ When previsiting a parent node, we push a copy thereof on the stack, making
+sure to mark it.
+
+<<optim.c function definitions>>=
+static statusCode_t
+PreVisitParent(optim_t * const me, const ast_t *ap)
+{
+  ast_t * copy;
+
+  (void)ap;
+  copy = Ast_Node(ap->type);
+  copy->rchild = copy;
+  Push(&me->stack, copy);
+  return SC_CONTINUE;
+}
+
+@ In postvisiting a node, we first pop the AST's off the stack built during the
+traversals of its children, followed by a copy of the parent node. After
+combining them into a single tree, we push the result back on the stack.
+
+<<optim.c function definitions>>=
+static statusCode_t
+PostVisitParent(optim_t * const me, const ast_t *ap)
+{
+  ast_t *   head;
+  ast_t *   children = NULL;
+
+  <<pop [[children]] and set [[head]] to parent>>
+
+  Ast_SetChildren(head, children);
+
+  <<replace empty composition with identity>>
+
+  Push(&me->stack, head);
+
+  return SC_CONTINUE;
+}
+
+@ Popping the child nodes produces them in the wrong (i.e., right-to-left)
+order. To counteract, we immediately push them onto a separate (initially
+empty) stack, which we afterwards use in setting the child list of their
+parent, popped immediately afterwards.
+
+<<pop [[children]] and set [[head]] to parent>>=
+for (;;) {
+  head = Pop(&me->stack);
+  assert(head);
+  if (!IsSibling(head)) {
+    /* head must be a parent */
+    break;
+  }
+  if (ap->type == AST_COMP) {
+    <<observe associativity and identity laws for composition>>
+  }
+  Push(&children, head);
+}
+@
+If the postvisited node is a composition, then based on its associativity we
+take special care to avoid adding a child node that is a composition itself,
+rather preferring to add the latter's children directly. Note we can safely
+assume that any such child compositions have themselves already been flattened
+during a previous postvisit, easing our task. In addition, we can entirely omit
+adding child nodes of type [[AST_ID]] by virtue of the identity law.
+
+<<observe associativity and identity laws for composition>>=
+switch (head->type) {
+case AST_COMP:
+  Prepend(&children, head->rchild);
+  /* Fall-through */
+case AST_ID:
+  Pool_Free(&g_ast_pool, (node_t *)head);
+  ++me->cnt;
+  continue;
+default:
+  break;
+}
+@
+By not adding child nodes of type [[AST_ID]] when constructing a composition,
+the latter may end up with no children at all. In this case, we replace it
+entirely with a node of type [[AST_ID]].
+
+<<replace empty composition with identity>>=
+if (head->type == AST_COMP && head->rchild == NULL) {
+  head->type = AST_ID;
+}
+@
+In most cases, we process a leaf node by simply copying it. In the paragraphs
+to come, we will discuss the exceptions to this rule one by one.
+
+<<optim.c function definitions>>=
+static statusCode_t
+VisitLeaf(optim_t * const me, const ast_t *ap)
+{
+  ast_t * copy;
+
+  copy = Ast_Node(ap->type);
+  copy->value = ap->value;
+  Push(&me->stack, copy);
+
+  return SC_CONTINUE;
+}
+
+@ Upon visiting \textit{Fst}, we verify if its sibling is a pair. If not, we
+resort to the default behaviour of simply copying it. Otherwise, we replace
+said pair with its first projection.
+
+<<optim.c function definitions>>=
+static statusCode_t
+VisitFst(optim_t * const me, const ast_t *ap)
+{
+  ast_t * head;
+
+  if ((head = Peek(me->stack)) && IsSibling(head)
+        && head->type == AST_PAIR) {
+    <<replace $\textit{Fst}\circ\langle f,g\rangle$ with $f$>>
+  }
+  return VisitLeaf(me, ap);
+}
+
+@ Our effective implementation of term transformations is rather naive, in that
+we often end up discarding part of our previous work. In replacing a pair with
+its first projection, for instance, we already built the former in its entirety
+only to now deallocate both the parent node and its right projection again.
+
+<<replace $\textit{Fst}\circ\langle f,g\rangle$ with $f$>>=
+Pop(&me->stack);
+Push(&me->stack, Pop(&head->rchild));
+Ast_Free(&head);
+++me->cnt;
+return SC_CONTINUE;
+@
+The actions applied at visiting \textit{Snd} should hold little surprise
+after having already studied the case of \textit{Fst}.
+
+<<optim.c function definitions>>=
+static statusCode_t
+VisitSnd(optim_t * const me, const ast_t *ap)
+{
+  ast_t * head;
+
+  if ((head = Peek(me->stack)) && IsSibling(head)
+        && head->type == AST_PAIR) {
+    <<replace $\textit{Snd}\circ\langle f,g\rangle$ with $g$>>
+  }
+  return VisitLeaf(me, ap);
+}
+
+@ The cleanup performed in the replacement of a pair with its second projection
+requires slightly more work compared to before, but otherwise follows much the
+same pattern.
+
+<<replace $\textit{Snd}\circ\langle f,g\rangle$ with $g$>>=
+Pop(&me->stack);
+Ast_Free((ast_t **)&head->rchild->base.link);
+Push(&me->stack, head->rchild);
+Pool_Free(&g_ast_pool, (node_t *)head);
+++me->cnt;
+return SC_CONTINUE;
+@
+We conclude with our last transformation, concerning the replacement of
+$\textit{App}\circ\langle\Lambda(f),g\rangle$ with $f\circ\langle\textit{Id},g
+\rangle$. Again, said transformation is triggered upon visiting \textit{App}
+when its sibling is a pair, otherwise defaulting to the mere creation of a
+copy.
+
+<<optim.c function definitions>>=
+static statusCode_t
+VisitApp(optim_t * const me, const ast_t *ap)
+{
+  ast_t * head;
+  ast_t * left;
+
+  if ((head = Peek(me->stack)) && IsSibling(head)
+      && head->type == AST_PAIR && (left = Peek(head->rchild))
+      && left->type == AST_CUR) {
+    <<replace $\textit{App}\circ\langle\Lambda(f),g\rangle$ with $f\circ\langle\textit{Id},g\rangle$>>
+  }
+  return VisitLeaf(me, ap);
+}
+@
+As before, the gory details reveal a naive approach, favouring redundant
+work.
+
+<<replace $\textit{App}\circ\langle\Lambda(f),g\rangle$ with $f\circ\langle\textit{Id},g\rangle$>>=
+Pop(&head->rchild);
+Ast_AddChild(head, Ast_Id());
+Push(&me->stack, left->rchild);
+Pool_Free(&g_ast_pool, (node_t *)left);
+++me->cnt;
+return SC_CONTINUE;

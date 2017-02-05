@@ -1,0 +1,132 @@
+\section{The REPL}\label{section:repl}
+We conclude our exposition with the REPL, orchestrating the entire application
+pipeline from parsing the input down to optimizing and evaluating the AST.
+<<main.c>>=
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "ast.h"
+#include "cam.h"
+#include "env.h"
+#include "except.h"
+#include "lexer.h"
+#include "optim.h"
+#include "parser.h"
+#include "pool.h"
+
+<<main.c constants>>
+<<main.c global variables>>
+<<main.c function definitions>>
+
+@ The REPL operates in a loop, on each iteration reading in a closed term from
+standard input on a separate line and passing it on to the parser.
+
+<<main.c function definitions>>=
+static int
+Evaluate(const char * const buff)
+{
+  ast_t * ap;
+  cam_t   cam;
+  lexer_t lexer;
+  optim_t optim;
+  int     result = -1;
+
+  <<parse input as [[ap]]>>
+  <<optimize [[ap]]>>
+  <<evaluate [[ap]] into [[result]]>>
+  <<cleanup and return [[result]]>>
+}
+
+@ To parse the input into an AST, it suffices to compose a lexer with a parser.
+<<parse input as [[ap]]>>=
+Lexer_Init(&lexer, buff);
+ap = Parse(&lexer);
+
+@ We next keep running optimization passes over the generated AST until no more
+transformations can be applied. In between each two passes, we make sure to
+clean up the old AST so as not to run out of memory.
+<<optimize [[ap]]>>=
+do {
+  Optim_Init(&optim);
+  Ast_Traverse(ap, (visit_t *)&optim);
+  Ast_Free(&ap);
+  ap = Pop(&optim.stack);
+  assert(IsEmpty(optim.stack));
+} while (optim.cnt != 0);
+
+@ Finally, we evaluate the AST and extract an integer result.
+<<evaluate [[ap]] into [[result]]>>=
+Cam_Init(&cam);
+Ast_Traverse(ap, (visit_t *)&cam);
+assert(cam.env->type == ENV_INT);
+result = cam.env->u.num;
+
+@ To prevent memory leaks, we should free any environment nodes allocated
+during evaluation, as well as the generated AST itself.
+<<cleanup and return [[result]]>>=
+Cam_Free(&cam);
+Ast_Free(&ap);
+return result;
+@
+The entry point to our application contains the looped invocation of
+[[Evaluate]].
+<<main.c function definitions>>=
+int
+main()
+{
+  char    buff[BUFF_SZ];
+  char *  cp;
+
+  for (;;) {
+    <<read line into [[buff]]>>
+    <<handle special commands>>
+    <<eval and print>>
+  }
+}
+@
+Note input lines are read into an internal buffer, whose size we restrict to
+256.
+
+<<main.c constants>>=
+enum {
+  BUFF_SZ = 256
+};
+
+@ To read a line, we keep reading characters until we see [['\n']] or the
+buffer is full.
+
+<<read line into [[buff]]>>=
+for (cp=buff; cp-buff<BUFF_SZ && (*cp=getchar())!='\n'; ++cp)
+  ;
+if (cp - buff == BUFF_SZ) {
+  fprintf(stderr, "Input too long.\n");
+  continue;
+}
+*cp = '\0';
+
+@ Intending for the interactive usage of the REPL, we signify the end of the
+session using a special command, as opposed to using [[EOF]] for said purpose.
+
+<<handle special commands>>=
+if (strcmp("halt", buff) == 0) {
+  return 0;
+}
+
+@ The invocation of [[Evaluate]] may throw exceptions, which we will catch at
+at the top of the loop.
+
+<<main.c global variables>>=
+jmp_buf *   g_handler;
+
+@ Exceptions are handled by clearing all memory pools and continuing with the
+next loop iteration.
+
+<<eval and print>>=
+TRY
+  printf("%d\n", Evaluate(buff));
+CATCH
+  Pool_Clear(&g_ast_pool);
+  Pool_Clear(&g_env_pool);
+  Pool_Clear(&g_symbol_pool);
+END

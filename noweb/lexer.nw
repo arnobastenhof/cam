@@ -1,0 +1,270 @@
+\chapter{The Read-Eval Print Loop}\label{chapter:repl}
+Having implemented both the interpreter and optimizer as tree traversals over
+AST's, we now proceed to the writing of a user interface for exercising them.
+Specifically, we shall provide a Read-Eval-Print Loop (REPL) accepting closed
+$\lambda$-terms denoting a number, which are then tokenized and parsed into an
+AST before being evaluated.
+
+In \S\ref{section:syntax}, we first provide a grammar for the specific fragment
+of $\lambda$-calculus that we shall support, adopting a syntax similar to that
+of LISP (though that's where the similarities end). We continue with tokenizing
+in \S\ref{section:lexer} and parsing in \S\ref{section:parser}, concluding with
+the REPL itself in \S\ref{section:repl}.
+
+\section{Concrete syntax}\label{section:syntax}
+Figure \ref{fig:ebnf} defines a grammar in Extended Backus-Naur Form (EBNF) for
+the input format that we shall accept.
+\begin{figure}
+\begin{verbatim}
+expr  = var | num | sum | app ;
+num   = digit, { digit } ;
+var   = alpha, { alpha } ;
+sum   = "(", "+", expr, { expr }, ")" ;
+app   = "(", abs, expr, { expr }, ")" ;
+abs   = "(", "lambda", "(", var, { var }, ")", expr, ")" ;
+alpha = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J"
+      | "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T"
+      | "U" | "W" | "X" | "Y" | "Z"
+      | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j"
+      | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t"
+      | "u" | "w" | "x" | "y" | "z" ;
+digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+\end{verbatim}
+\caption{Input format in EBNF.}
+\label{fig:ebnf}
+\end{figure}
+Though we assume familiarity on the reader's part with context-free grammars,
+our notation, conforming to the ISO standard \cite{iso1996}, may require a few
+words of explanation. The distinction between terminal- and non-terminal
+symbols is one of the absence, resp. presence of surrounding double quotes.
+Comma denotes concatenation, and alternatives are indicated by vertical bars.
+Rules are terminated by a semicolon, and, finally, repetition (in the sense of
+0 or more) is denoted using curly brackets.
+
+The language we defined does not admit the full generality that ordinary
+$\lambda$-calculus provides, and moreover defines but one operator constant.
+Little stands in the reader's way of extending the current codebase to rememdy
+the latter limitation, although the first is more serious. Specifically, to
+make our life easier, we have restricted to the description of expressions all
+whose constituents we are certain denote numbers. This obviates the need for
+type checking, but makes it impossible to abstract over functions. To
+illustrate, let us consider some concrete expressions that may be formed using
+the above grammar. First,
+\begin{verbatim}
+((lambda (x y) (+ 1 x y)) 2 (+ 3 4))
+\end{verbatim}
+Landin \cite{landin1964} explains expressions like the above as an encoding of
+auxiliary definitions, e.g.,
+\begin{center}
+$1 + x + y$ \textbf{where} $x = 2$ \textbf{and} $y = 3 + 4$
+\end{center}
+Notice in particular some of the shorthands we have admitted ourselves. Whereas
+previously we only allowed abstraction over a single variable at a time, above
+we seemingly bound both $x$ and $y$ to the same $\lambda$. The way we shall
+resolve this seeming discrepancy in what is to follow is by considering the
+current example an abbreviation for two separate bindings, one of $x$ and the
+other of $y$. Similarly, if we assume application associates to the left, we
+can simply write, e.g., $(+ \ 1 \ x \ y)$ instead of $((+ \ 1 \ x) \ y)$.
+
+Besides cases like the above, Landin also discusses how $\lambda$-calculus may
+be used to represent function definitions, giving, among others, the following
+(here simplified) example on p.311:
+\begin{center}
+$f(3) + f(4)$ \textbf{where} $f(y) = y + 1$
+\end{center}
+An attempt at expressing this in our input language may run as follows:
+\begin{verbatim}
+((lambda (f) (+ (f 3) (f 4))) (lambda (y) (+ y 1)))
+\end{verbatim}
+were it not for the fact that our grammar only permits the appearance of an
+abstraction in the first sub-expression of an application, which the above
+violates. As mentioned, this limitation was part of a conscious design decision
+to keep the parser as simple as possible, allowing to focus more on the CAM's
+implementation while enabling the project's completion within a reasonable
+timeframe.
+
+\section{The lexer}\label{section:lexer}
+
+\subsection{Interface}
+The lexer's task is to tokenize the input stream, relieving the parser from
+the burden of dealing with matters of formatting by grouping non-whitespace
+characters into meaningful chunks.
+
+<<lexer.h>>=
+#ifndef LEXER_H_
+#define LEXER_H_
+
+<<lexer.h constants>>
+<<lexer.h typedefs>>
+<<lexer.h function prototypes>>
+
+#endif /* LEXER_H_ */
+
+@ Token types are encoded by integers, those categorizing single characters
+being assigned the latter's ASCII value. In addition, we created a 'sentinel'
+value to be used in case of errors or when the end of the input has been
+reached.
+
+<<lexer.h typedefs>>=
+typedef enum {
+  /* multi-character tokens */
+  LEX_LAMBDA = 1,   /* "lambda" */
+  LEX_VAR    = 2,   /* e.g., "foo", "Bar" */
+  LEX_NUM    = 3,   /* integers */
+
+  /* single-character tokens */
+  LEX_LBRACK = 40,  /* '(' */
+  LEX_RBRACK = 41,  /* ')' */
+  LEX_PLUS   = 43,  /* '+' */
+
+  /* special value for errors and end-of-string */
+  LEX_NONE   = 0,
+} tokenType_t;
+
+@ A lexer's state includes a buffer for storing the recognized token, together
+with its type. An additional pointer stores the position in the input string.
+
+<<lexer.h typedefs>>=
+typedef struct lexer_s {
+  char          token[MAXTOK + 1];
+  tokenType_t   type;
+  const char *  ptr;
+} lexer_t;
+
+@ We imposed a maximum token size of 10, having reserved an additional
+character in the input buffer for storing the terminating [['\0']].
+
+<<lexer.h constants>>=
+enum {
+  MAXTOK = 10
+};
+
+@ Lexer instances are allocated on the stack and passed to an initialization
+method via a pointer. The latter additionally takes a reference to the
+beginning of the input, which will reside in an in-memory string buffer filled
+by the REPL.
+
+<<lexer.h function prototypes>>=
+extern void   Lexer_Init(lexer_t * const, const char * const);
+@
+Retrieving the next token sets the lexer's buffer and token type, returning
+the number of (non-whitespace) characters read. The end of the input is
+indicated by [[0]], while [[-1]] signals an error.
+
+<<lexer.h function prototypes>>=
+extern int    Lexer_NextToken(lexer_t * const);
+@ \subsection{Implementation}
+
+<<lexer.c>>=
+#include "lexer.h"
+
+#include <assert.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+<<lexer.c function definitions>>
+
+@ The lexer is initialized by clearing its buffer and setting the start of the
+input.
+
+<<lexer.c function definitions>>=
+void
+Lexer_Init(lexer_t * const me, const char * const input)
+{
+  assert(me);
+  assert(input);
+
+  me->token[0] = '\0';
+  me->type = LEX_NONE;
+  me->ptr = input;
+}
+
+@ To get a token we switch on the next non-whitespace character in the input.
+At this point, we also start copying any character we read to the lexer's
+buffer.
+
+<<lexer.c function definitions>>=
+int
+Lexer_NextToken(lexer_t * const me)
+{
+  char *  cp;
+
+  assert(me);
+
+  for (; isspace(*me->ptr); ++me->ptr)
+    ;
+  cp = me->token;
+  switch (*me->ptr) {
+  <<NextToken cases>>
+  default:
+    <<NextToken error handling>>
+  }
+  <<NextToken return character count>>
+}
+@
+The input is terminated by the same character [['\0']] delimiting strings in
+C.
+
+<<NextToken cases>>=
+case '\0':
+  me->type = LEX_NONE;
+  break;
+@
+Recall single-character tokens coincide with the value of their token type.
+
+<<NextToken cases>>=
+case '+': case '(': case ')':
+  me->type = *cp++ = *me->ptr++;
+  break;
+@
+Integers are recognized by continuing to read digits until the token buffer
+is full.
+
+<<NextToken cases>>=
+case '0': case '1': case '2': case '3': case '4': case '5':
+case '6': case '7': case '8': case '9':
+  do {
+    *cp++ = *me->ptr++;
+  } while (cp - me->token < MAXTOK && isdigit(*me->ptr));
+  me->type = LEX_NUM;
+  break;
+@
+The logic for recognizing variable names bears strong resemblance to that of
+integers, although we must remember to check for the keyword [[lambda]].
+
+<<NextToken cases>>=
+case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+case 'g': case 'h': case 'i': case 'j': case 'k': case 'l':
+case 'm': case 'n': case 'o': case 'p': case 'q': case 'r':
+case 's': case 't': case 'u': case 'v': case 'w': case 'x':
+case 'y': case 'z':
+case 'A': case 'B': case 'C': case 'D': case 'E': case 'F':
+case 'G': case 'H': case 'I': case 'J': case 'K': case 'L':
+case 'M': case 'N': case 'O': case 'P': case 'Q': case 'R':
+case 'S': case 'T': case 'U': case 'V': case 'W': case 'X':
+case 'Y': case 'Z':
+  do {
+    *cp++ = *me->ptr++;
+  } while (cp - me->token < MAXTOK && isalpha(*me->ptr));
+  me->type = (strcmp(me->token, "lambda") == 0)
+    ? LEX_LAMBDA
+    : LEX_VAR;
+  break;
+@
+If the next input character cannot be the start of a valid token, we print an
+error message, empty the token buffer and signal an error.
+
+<<NextToken error handling>>=
+fprintf(stderr, "Unexpected character: %c.\n", *me->ptr);
+*cp = '\0';
+me->type = LEX_NONE;
+++me->ptr;
+return -1;
+@
+Once a valid token has been read in, we return its size after properly
+terminating the string in the token buffer.
+
+<<NextToken return character count>>=
+*cp = '\0';
+return cp - me->token;

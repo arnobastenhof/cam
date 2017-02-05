@@ -1,0 +1,100 @@
+@ \section{Error handling}\label{section:exceptions}
+Hanson \cite{hanson1996} distinguishes three types of errors. The most common
+are user errors, like specifying a non-existing file. The caller is typically
+notified via a status code, or through the return of a special value. Error
+recovery, e.g., for the purpose of cleaning up acquired resources, be it within
+the method where the error occurred or its caller, is usually separated from
+the main program flow through a local forward jump. Next are errors in the
+programming itself, i.e., bugs, from which recovery is impossible. At least
+for test builds, such circumstances may be caught using the standard library's
+[[assert]] facilities. Third, and finally, are exceptions. Like with user
+errors, recovery may sometimes be possible, though exceptions usually occur
+far less frequently. As typical examples Hanson mentions various cases of
+under- and overflow, as well as, what currently interests us the most, memory
+depletion.  Because of their infrequent occurrence, exceptions are ill-served
+by status codes, cluttering up the normal program flow with code for rare
+conditions.  Instead, the C standard library offers [[setjmp]] and [[longjmp]]
+for enabling non-local jumps, allowing code for handling the exception to be
+completely separated from program logic distributed over multiple methods. In
+general, however, exceptions may occur nested, sometimes even having to be
+re-raised within a handler in order for another handler higher in the chain to
+process it. Besides that, a given handler sometimes has to distinguish between
+multiple types of exceptions, applying a different recovery logic to each.
+[[setjmp]] and [[longjmp]] are too primitive to address all these use cases
+conveniently, and for this purpose are often taken as the basis for writing
+higher-level abstractions with. Our own situation is less complex: we shall not
+have to differentiate between exceptions based on their type, nor do we require
+more than a single handler. On the hander hand, we \textit{will} have to be
+able to raise exceptions on more occassions than for handling memory errors
+alone, so that at least some degree of abstraction is warranted, though of far
+less generality than is needed for supporting every use case imaginable.
+
+<<except.h>>=
+#ifndef EXCEPT_H_
+
+#include <setjmp.h>
+#include <stdlib.h>
+
+<<except.h macros>>
+<<except.h variable declarations>>
+
+#endif /* EXCEPT_H_ */
+
+@ To enact a non-local jump, the jump site must be known first. To this end,
+the C standard library offers the method [[setjmp]], to be called prior to
+[[longjmp]] for executing the actual jump. Since nothing prevents us from 
+invoking the former more than once, we need a means of synchronization to match
+[[longjmp]] to the right call of [[setjmp]]. Such is achieved by having both
+take as argument an object of type [[jmp_buf]]. For our own purposes, we shall
+require but a single handler for processing all exceptions, so that only one
+[[jmp_buf]] object will suffice. Still, we shall want to make sure that
+[[setjmp]] has in fact been called thereon before invoking [[longjmp]]. By
+exporting a \textit{pointer} to a [[jmp_buf]] object, we can by default set
+it to [[NULL]] and initialize it only prior to the call to [[setjmp]], making a
+null-check suffice before invoking [[longjmp]] to affirm that the jump site has
+indeed been set.
+
+<<except.h variable declarations>>=
+extern jmp_buf *g_handler;
+@
+The way [[setjmp]] works is that it returns twice: the first time with $0$,
+and afterwards with a non-zero value to indicate an exception was raised. It is
+thus conventionally used as the condition of an [[if]] statement (or sometimes
+as part of a [[switch]], if multiple exception type have to be distinguished),
+with the normal- and exceptional program flows being coded as the then- and
+else clauses. We will wrap this idiom inside a syntax akin to that of Java's
+try/catch mechanism using the macro's below, allowing us to render it by
+[[TRY <normal flow> CATCH <exception flow> END]]. Note that in doing so, we
+have to be careful to set [[g_handler]] to non-[[NULL]] prior to the [[TRY]]
+clause, and to reset it back to [[NULL]] after the [[CATCH]].
+
+<<except.h macros>>=
+#define TRY {                     \
+  jmp_buf handler;                \
+                                  \
+  g_handler = &handler;           \
+  if (!setjmp(handler)) {
+
+#define CATCH } else {
+
+#define END }                     \
+    g_handler = NULL;             \
+  }
+
+@ To [[THROW]] an exception, we must first make sure that the jump site has
+been set by validating [[g_handler]] is non-[[NULL]], otherwise simply exiting.
+Note furthermore that [[longjmp]] takes a second integral argument, indicating
+the value returned by [[setjmp]]. If multiple exception types are to be
+distinguished, here is the place to do it. For our purposes, however, we can
+simply always return $1$. Finally, to allow the user to write [[THROW;]], i.e.,
+including the semi-colon, we have applied a standard trick by wrapping our
+macro inside a do-while.
+
+<<except.h macros>>=
+#define THROW do {                \
+  if (*g_handler) {               \
+      longjmp(*g_handler, 1);     \
+  } else {                        \
+    exit(1);                      \
+  }                               \
+} while (0)

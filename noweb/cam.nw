@@ -1,0 +1,332 @@
+@ \section{The Categorical Abstract Machine}\label{section:cam}
+We motivated AST's using an algebraic notation for representing functions,
+explaining how their computation corresponded to evaluating a term inside a
+binding environment. The notational device we used forms part of a branch of
+mathematics known as category theory. While its further exposition would take
+us too far afoot, our interest in mentioning it derives from it being the
+namesake for Cousineau et al.'s Categorical Abstract Machine
+\cite{cousineau1985} (or CAM, for short), formalizing our intuitive
+explanations about evaluation using a language of machine instructions. In this
+section, we will implement the CAM as a tree walk over AST's, s.t. each
+instruction corresponds to the visitation of a node.
+
+\subsection{Interface}
+
+<<cam.h>>=
+#ifndef CAM_H_
+#define CAM_H_
+
+#include <stdbool.h>
+
+#include "ast.h"
+#include "env.h"
+
+<<cam.h typedefs>>
+<<cam.h function prototypes>>
+
+#endif /* CAM_H_ */
+
+@ At minimum, the CAM's state should comprise an AST and a binding environment
+to evaluate it in, noting the visitor methods supply the former if we implement
+the CAM's operation as a tree walk. It turns out this is almost enough, and
+that we need but one extra component. Specifically, recall the evaluation of
+pairings $\langle f,g\rangle$ in an environment $\Gamma$ is defined in terms of
+the independent evaluations of its projections $f$ and $g$ in $\Gamma$. To
+implement this procedure by a sequential machine, we must choose which to
+evaluate first, say, $f$, and to store a copy of $\Gamma$ somewhere temporarily
+until we are ready to continue with $g$. Since function pairings can nest, it
+follows we may have to provide temporary storage for more than a single
+environment at a time on a last-in first-out basis.
+
+<<cam.h typedefs>>=
+typedef struct {
+  visit_t   base;
+  env_t *   env;
+  env_t *   stack;
+} cam_t;
+
+@ Instances of the CAM are always allocated on the stack, though requiring
+initialization. During its operation, however, resources may be acquired
+dynamically for building environments, which we must clean up again afterwards.
+
+<<cam.h function prototypes>>=
+extern void Cam_Init(cam_t * const);
+extern void Cam_Free(cam_t * const);
+@
+\subsection{Implementation}
+
+<<cam.c>>=
+#include "cam.h"
+
+#include <assert.h>
+
+#include "pool.h"
+
+<<cam.c function prototypes>>
+<<cam.c function definitions>>
+
+@ The CAM's instruction set is implemented by visitor methods, each of which
+we will explain in turn below.
+
+<<cam.c function prototypes>>=
+static statusCode_t VisitFst(cam_t * const, const ast_t *);
+static statusCode_t VisitSnd(cam_t * const, const ast_t *);
+static statusCode_t VisitQuote(cam_t * const, const ast_t *);
+static statusCode_t VisitApp(cam_t * const, const ast_t *);
+static statusCode_t VisitCur(cam_t * const, const ast_t *);
+static statusCode_t VisitPush(cam_t * const, const ast_t *);
+static statusCode_t VisitSwap(cam_t * const, const ast_t *);
+static statusCode_t VisitCons(cam_t * const, const ast_t *);
+static statusCode_t VisitPlus(cam_t * const, const ast_t *);
+
+@ Initialisation sets the virtual function table, the environment and the
+stack.
+
+<<cam.c function definitions>>=
+void Cam_Init(cam_t * const me)
+{
+  <<define [[cam_t]] virtual function table>>
+
+  assert(me);
+
+  <<initialize [[cam_t]] state>>
+}
+
+@ The reasons for separating out a virtual function table from the definition
+of a visitor was to allow for sharing of the former's instances. As such, we
+define the table used for our implementation of the CAM by a static variable,
+guaranteeing the same object is accessed among multiple invocations of
+[[Cam_Init]]. Note further we need explicit casts from our custom visitor
+methods to [[visitFunc_t]] because of their first argument being typed
+[[cam_t]]. Since, however, every [[cam_t]] `is a' [[visitor_t]] (in the reading
+commonly attributed to this phrase in the Object-Oriented paradigm), this is
+safe.
+
+<<define [[cam_t]] virtual function table>>=
+static const visitVtbl_t vtbl = {
+                VisitDefault,   /* VisitId */
+  (visitFunc_t) VisitApp,       /* VisitApp */
+  (visitFunc_t) VisitQuote,     /* VisitQuote */
+  (visitFunc_t) VisitPlus,      /* VisitPlus */
+  (visitFunc_t) VisitFst,       /* VisitFst */
+  (visitFunc_t) VisitSnd,       /* VisitSnd */
+                VisitDefault,   /* PreVisitComp */
+  (visitFunc_t) VisitPush,      /* PreVisitPair */
+  (visitFunc_t) VisitCur,       /* PreVisitCur */
+  (visitFunc_t) VisitSwap,      /* InVisitPair */
+                VisitDefault,   /* PostVisitComp */
+  (visitFunc_t) VisitCons,      /* PostVisitPair */
+                VisitDefault    /* PostVisitCur */
+};
+@
+As for the CAM's state, we start out with a clean slate by using a 0-tuple
+for its environment together with an empty stack.
+
+<<initialize [[cam_t]] state>>=
+me->env = Env_Nil();
+me->stack = NULL;
+me->base.vptr = &vtbl;
+@
+Before retiring one of the CAM's instances, we first have to clean up its
+environment and stack, both having been dynamically allocated.
+
+<<cam.c function definitions>>=
+void Cam_Free(cam_t * const me)
+{
+  Env_Free(&me->env);
+  Env_FreeList(&me->stack);
+}
+
+@ We ease into our exposition of the CAM's instruction set with the
+interpretation of constants. Recall that given a non-negative integer $c$, we
+have $('c)(\Gamma)=c$ for any environment $\Gamma$. We can translate this to an
+instruction \textsc{quote}, applied to an AST of type [[AST_INT]], and having
+the effect of discarding the current environment and replacing it with a single
+numeric constant. Note in particular how we stored the results of our 
+evaluation. In general, we shall write our code to observe the following
+invariants. After a node $f$'s postvisiting, the CAM's environment will consist
+of the single value obtained from computing $f(\Gamma)$, where $\Gamma$ was its
+environment prior to $f$'s previsiting. In addition, after $f$'s traversal, the
+stack will be (back) in the same state as before. Both these invariants should
+be kept firmly in mind when reading the explanations and code to come.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitQuote(cam_t * const me, const ast_t *ap)
+{
+  Env_Free(&me->env);
+  me->env = Env_Int(ap->value);
+
+  return SC_CONTINUE;
+}
+
+@ Given $\langle f,g\rangle$, we can read each of `$\langle$', `$,$' and
+`$\rangle$' as separate machine instructions, coinciding, respectively, with
+pre-, in- and postvisiting an AST of type [[AST_PAIR]]. The first pushes a copy
+of the environment $\Gamma$ on the stack, earning it the name \textsc{push}.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitPush(cam_t * const me, const ast_t *ap)
+{
+  (void)ap;
+
+  Push(&me->stack, Env_Copy(me->env));
+
+  return SC_CONTINUE;
+}
+
+@ Prior to `in'visiting $\langle f,g\rangle$, the machine is in a state where
+its environment contains the result of computing $f(\Gamma)$ for some $\Gamma$,
+and with a copy of the latter at the head of its stack. Our next task shall be
+to compute $g(\Gamma)$, thus requiring to pop $\Gamma$ off the stack again to
+set the machine's environment therewith. At the same time we still have to
+retain our previous result, needing it again for when we're done traversing
+$g$. As it turns out, the stack provides the perfect spot for safekeeping,
+reducing our task to that of simply \textsc{swap}ping the CAM's environment
+with the top of its stack.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitSwap(cam_t * const me, const ast_t *ap)
+{
+  env_t *  tmp;
+
+  (void)ap;
+  assert(me->stack != NULL);
+
+  tmp = Pop(&me->stack);
+  Push(&me->stack, me->env);
+  me->env = tmp;
+
+  return SC_CONTINUE;
+}
+
+@ As we are about to postvisit $\langle f,g\rangle$, we have $g(\Gamma)$ set
+as our environment and $f(\Gamma)$ at the top of the stack. To finish the job,
+we must pop the stack and replace the environment with $(f(\Gamma),g(\Gamma))$,
+referring to the corresponding instruction by \textsc{cons}.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitCons(cam_t * const me, const ast_t *ap)
+{
+  (void)ap;
+  assert(me->stack != NULL);
+
+  me->env = Env_Pair((env_t *)Pop(&me->stack), me->env);
+
+  return SC_CONTINUE;
+}
+
+@ Remember \textit{Fst} always takes as argument a \emph{pair} $(x,y)$,
+returning $x$. Similarly, in its visiting we shall assume the CAM's environment
+to be a pair as well, stating this as a precondition. While extracting the
+first projection should hardly pose a challenge, we do have to be careful in
+ensuring both its sibling and its parent are properely cleaned up again.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitFst(cam_t * const me, const ast_t *ap)
+{
+  env_t *  proj;
+
+  (void)ap;
+  assert(me->env->type == ENV_PAIR);
+
+  proj = Pop(&me->env->u.rchild);
+  proj->base.link = NULL; /* prevent dangling pointer */
+  Env_Free(&me->env);
+  me->env = proj;
+
+  return SC_CONTINUE;
+}
+
+@ The same considerations discussed for \textit{Fst} apply to \textit{Snd} as
+well, resulting in largely similar code.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitSnd(cam_t * const me, const ast_t *ap)
+{
+  env_t *  proj;
+
+  (void)ap;
+  assert(me->env->type == ENV_PAIR);
+
+  proj = me->env->u.rchild;
+  Env_Free((env_t **)&proj->base.link);
+  Pool_Free(&g_env_pool, (node_t *)me->env);
+  me->env = proj;
+
+  return SC_CONTINUE;
+}
+
+@ In visiting an abstraction $\Lambda(f)$ with an environment $\Gamma$, we
+replace the latter with a closure, determining a mapping
+$v\mapsto f(\Gamma, v)$. It follows that we cannot yet walk $f$ until its
+second argument $v$ is known, meaning we have to skip it for now. As explained
+before, the operator $\Lambda$ essentially amounts to Currying, motivating
+the name \textsc{cur} for referring to the current instruction.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitCur(cam_t * const me, const ast_t *ap)
+{
+  me->env = Env_Closure(me->env, ap->rchild);
+
+  return SC_SKIP;
+}
+
+@ In visiting \textit{App}, we state the precondition(s) that the environment
+is a pair whose first projection is a closure formed from $f$ and $\Gamma$. We
+proceed by computing $f(\Gamma,v)$ for $v$ the second projection, meaning we
+traverse $f$ with the environment set to $(\Gamma,v)$.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitApp(cam_t * const me, const ast_t *ap)
+{
+  env_t *   closure;
+
+  (void)ap;
+  assert(me->env->type == ENV_PAIR);
+
+  closure = Pop(&me->env->u.rchild);
+  assert(closure->type == ENV_CLOSURE);
+
+  Push(&me->env->u.rchild, closure->u.cl.ctx);
+  Ast_Traverse(closure->u.cl.code, (visit_t *)me);
+  Pool_Free(&g_env_pool, (node_t *)closure);
+
+  return SC_CONTINUE;
+}
+
+@ In visiting $+$, we assume the environment to be set to $(m,n)$ for
+non-negative integers $m,n$, replacing it with $m+n$. The details, however, get
+a bit messy in the reuse of (environment) nodes to minimize cleanup and prevent
+new allocations.
+
+<<cam.c function definitions>>=
+static statusCode_t
+VisitPlus(cam_t * const me, const ast_t *ap)
+{
+  env_t *  left;
+  env_t *  right;
+
+  (void)ap;
+
+  assert(me->env->type == ENV_PAIR);
+  left = Pop(&me->env->u.rchild);
+  assert(left->type == ENV_INT);
+  right = Pop(&me->env->u.rchild);
+  assert(right->type == ENV_INT);
+
+  left->u.num += right->u.num;
+  left->base.link = NULL; /* prevent dangling pointer */
+  Pool_Free(&g_env_pool, (node_t *)right);
+  Pool_Free(&g_env_pool, (node_t *)me->env);
+  me->env = left;
+
+  return SC_CONTINUE;
+}

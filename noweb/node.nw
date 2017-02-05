@@ -1,0 +1,252 @@
+@ \chapter{Memory management}
+The current chapter discusses algorithms for managing dynamically allocated
+resources, lifted largely from Knuth \cite{knuth1997}. Overall, we favoured
+linked representations for our data structures, most of which can always be
+stored on the stack. What remains are but three distinct object sizes that must
+be acquirable at runtime, to which effect fixed-size memory pools are
+particularly well suited given their attractive properties of constant-time
+allocation and deallocation. We start our exposition in \S\ref{section:lists}
+with a relatively self-contained implementation of circular linked lists,
+offering a gentle introduction to our use of literate programming. Next, after
+a brief interlude about error handling in \S\ref{section:exceptions}, the
+fruits of our efforts will be used in \S\ref{section:pools} as the basis for
+implementing memory pools.
+
+\section{Circular linked lists}\label{section:lists}
+In Volume I of TAOCP, Knuth \cite{knuth1997} offers a comprehensive account of
+linked representations for basic data types, including various sorts of both
+lists and trees. Most of what is to follow in this text builds forth in one way
+or another on but a small part of Knuth's discussion, although his account of
+cyclic linked lists shall re-occur time and again as the basis for more
+involved data structures. Specifically, they can be used for implementing the
+operations of both a stack and queue in constant time, besides being easily
+concatenated. Though the use of another link for every node would have provided
+even more flexibility, we shall find that for our own purposes, singly-linked
+lists, when circular, hit the sweet spot.
+
+\subsection{Interface}
+Linked lists are made up of nodes, and it is by that name to which we shall
+refer to our module.
+
+<<node.h>>=
+#ifndef NODE_H_
+#define NODE_H_
+
+<<node.h macros>>
+<<node.h typedefs>>
+<<node.h structs>>
+<<node.h function prototypes>>
+
+#endif /* NODE_H_ */
+
+@ A circular linked list is like an ordinary singly-linked list, except that
+the last node points to the first. A certain realization may dawn upon a
+moment's reflection that what comes first and what last is now no longer as
+clear-cut as it used to be, and we shall resolve the matter by having the
+client code decide. Specifically, we will write our interface so as to ask for
+each operation a pointer to what should be deemed the last node of a list,
+noting the first to then be removed by only a single dereference.\footnote{In
+contrast, had we understood our pointers to identify the first node, then
+finding the last would take linear time again.}
+
+<<node.h typedefs>>=
+typedef struct node_s node_t;
+
+@ Individual nodes are woven into a list by having each point to its successor,
+referring to such references by links. What may be initially surprising is that
+we don't include any fields for holding the data into the definition of a node.
+Ordinarily void pointers are often used for this purpose, constituting the
+C language's `generic' pointer type. This approach proves limiting, however,
+when basic types must be stored, or when the data is to be spread out over
+multiple fields. Another approach, used, for instance, in the Linux kernel,
+relies on the address of a struct coinciding with that of its first field.
+By restricting the definition of a node to capture only the concept of a link,
+we can then embed it as the first element of another struct that holds the data
+fields, with the above property guaranteeing we can freely cast between the
+two types. Later, we shall see how this technique can also be used to perform
+object-oriented programming in C. To move our discussion back to cyclic linked
+lists proper, we note that, compared to their non-cyclic counterparts, we
+cannot rely on [[NULL]] to terminate the list, although they will still be used
+for representing empty ones.
+
+<<node.h structs>>=
+struct node_s {
+  node_t *  link;
+};
+
+@ Due to their circular nature, we shall be able to implement the addition of
+nodes at both the front and back of lists in constant time. The list itself we
+represent by a double pointer type, as needed for maintaining the invariant
+that its reference is a pointer to the last node. The node to be added, in
+turn, may be more conventionally communicated through a single pointer.
+
+<<node.h function prototypes>>=
+extern void     Node_AddFirst(node_t ** const, node_t * const);
+extern void     Node_AddLast(node_t ** const, node_t * const);
+@
+Had we used two links per node, we could similarly have implemented removal
+from both ends of a list in constant time as well. With but a single link,
+on the other hand, the best we can do without expanding into linear time is to
+remove the first node. Though this operation returns a pointer to a node, we
+instead used a void pointer for typing the result. The reason for this is that
+in most cases, what is passed to these methods is not just a double pointer to
+a node by itself, but rather to one that is placed adjacent in memory to its
+data fields as part of another struct. By returning a void pointer, we can
+relieve the client somewhat from having to explicitly cast the result back to
+the proper struct type.
+
+<<node.h function prototypes>>=
+extern void *   Node_RemoveFirst(node_t ** const);
+@
+Besides expanding a list by a single node, we shall also find the occassional
+need to concatenate a given list with another at either one of its ends. Both
+these operations we shall again be able to perform in constant time.
+
+<<node.h function prototypes>>=
+extern void     Node_Prepend(node_t ** const, node_t * const);
+extern void     Node_Append(node_t ** const, node_t * const);
+@
+Our choice for separating the data fields from the definition of a node
+proper comes with the consequence of the arguments passed to the methods
+declared by the current interface having to first be explicitly `down'-casted
+to a node. To prevent client code from becoming cluttered with such casts, we
+export a set of macros that can do the work for us. In naming them, we have
+made explicit their use in implementing the operations of stacks and queues.
+
+<<node.h macros>>=
+#define Push(me,np)    Node_AddFirst((node_t **)(me),(node_t *)(np))
+#define Pop(me)        Node_RemoveFirst((node_t **)(me))
+#define Enqueue(me,np) Node_AddLast((node_t **)(me),(node_t *)(np))
+#define Append(me,np)  Node_Append((node_t **)(me),(node_t *)(np))
+#define Prepend(me,np) Node_Prepend((node_t **)(me),(node_t *)(np))
+
+@ Besides macros wrapping our function declarations, we add another three for
+finding the successor of a node, testing whether a given list is empty, and,
+finally, for returning the head of a list, or [[NULL]] if empty.
+
+<<node.h macros>>=
+#define Link(me)    (void *)(((node_t *)(me))->link)
+#define IsEmpty(me) ((me) == NULL)
+#define Peek(me)    (void *)(IsEmpty(me) ? NULL : ((node_t *)(me))->link)
+
+@ \subsection{Implementation}
+As noted before, the implementation of circular linked lists that follows is
+based largely on their discussion by Knuth \cite{knuth1997}. The difficulty
+we shall mostly find to lie in taking into account the cases where one of
+a method's parameters refers to the empty list, i.e., equals [[NULL]].
+
+<<node.c>>=
+#include "node.h"
+
+#include <assert.h>
+#include <stddef.h>
+
+<<node.c function definitions>>
+
+@ In adding a node to the front of a list, we must consider two cases. If the
+list is not empty, we insert the new node in between its tail and head,
+whereas if instead the list is empty, the new node \textit{becomes} the list,
+pointing to itself.
+
+<<node.c function definitions>>=
+void
+Node_AddFirst(node_t ** const me, node_t * const np)
+{
+  assert(me);
+  assert(np);
+
+  if ((*me)) {
+    np->link = (*me)->link;
+    (*me)->link = np;
+  } else {
+    *me = np;
+    np->link = np;
+  }
+}
+
+@ If we can add a node to the front of a list, then we can add it to the back
+as well simply by additionally updating the list's tail.
+
+<<node.c function definitions>>=
+void
+Node_AddLast(node_t ** const me, node_t * const np)
+{
+  assert(me);
+  assert(np);
+
+  Node_AddFirst(me, np);
+  *me = np;
+}
+
+@ In removing the head of a list, we have two corner cases to consider. First,
+the list may be empty, in which case we choose to return [[NULL]]. Perhaps
+somewhat less obviously, special care must be taken as well if the removed
+node was the only one in the list, requiring us to set the latter to [[NULL]].
+
+<<node.c function definitions>>=
+void *
+Node_RemoveFirst(node_t ** const me)
+{
+  node_t *  np;
+
+  assert(me);
+
+  if (IsEmpty(*me)) {
+    return NULL;
+  }
+
+  np = (*me)->link;
+  (*me)->link = np->link;
+  if (*me == np) {
+    *me = NULL;
+  }
+  return np;
+}
+
+@ Our interface exported two methods for concatenating lists. The difference is
+one of perspective: between the two input lists, one serves the double purpose
+of also storing the output, being represented by a double pointer. If the 
+in parameter is added to the front of the in-out parameter, we speak of
+prepending, otherwise of appending. Starting with our implementation of the
+former, we must be careful to account for the possibility that either input
+might refer to an empty list. If neither does, we simply make the tails of both
+lists point to the other's head.
+
+<<node.c function definitions>>=
+void
+Node_Prepend(node_t ** const me, node_t * const np)
+{
+  node_t *  tmp;
+
+  if (IsEmpty(np)) {
+    return;
+  }
+  if (IsEmpty(*me)) {
+    *me = np;
+    return;
+  }
+  tmp = np->link;
+  np->link = (*me)->link;
+  (*me)->link = tmp;
+}
+
+@ Appending differs little from prepending, except that now the in-out
+parameter's reference will also have to be updated when pointing at a
+non-empty list.
+
+<<node.c function definitions>>=
+void
+Node_Append(node_t ** const me, node_t * const np)
+{
+  node_t  *tmp;
+
+  if (IsEmpty(np)) {
+    return;
+  }
+  if ((*me)) {
+    tmp = np->link;
+    np->link = (*me)->link;
+    (*me)->link = tmp;
+  }
+  *me = np;
+}

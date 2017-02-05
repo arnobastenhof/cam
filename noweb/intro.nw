@@ -1,0 +1,523 @@
+\chapter{Introduction}\label{introduction}
+The current document details a modest literate implementation in the C
+programming language of an abstract machine for interpreting functional
+programming languages. The practice of literate programming has originated in
+a proposal by Knuth \cite{knuth1984}, and we will have a few more words to say
+about it below. Abstract machines for functional programs, in turn, go back
+to Landin's SECD \cite{landin1964} (named after its components, the
+\emph{Stack}, \emph{Environment}, \emph{Control} and \emph{Dump}), originally
+presented as a means of implementing ISWIM \cite{landin1966}. Here, however,
+we shall instead focus on the more recent \emph{Categorical Abstract Machine}
+(or \emph{CAM}, for short) from Cousineau, Curien and Mauny
+\cite{cousineau1985}, having its roots in De Bruijn's name-free notation for
+binding constructs \cite{debruijn1972}, Curry et al.'s combinatory logic
+\cite{curry1972} and category theory (an introductory account of which from the
+perspective of computer science may be found in, e.g., \cite{crole1993}).
+
+We shall proceed as follows. First, in \S\ref{lambda} a brief introduction will
+be provided on the (untyped) $\lambda$-calculus, serving as the core of any
+functional programming language.  Next, \S\ref{literate} discusses literate
+programming and our implementation of it, with the works of Fraser and Hanson
+\cite{fraser1995}, \cite{hanson1996} constituting our main sources of
+inspiration. Our coding style and conventions are documented in
+\S\ref{conventions}, again taking more than a hint or two from Fraser and
+Hanson. Finally, in \S\ref{overview} the scope of this work is dicussed,
+together with an outline of the project as a whole. Our aims having been
+primarily self-educational, we imposed severe restrictions from the outset on
+the results we intended to achieve in order to maintain focus and allow for
+completion within a reasonable timeframe. Most notably, our interest was
+primarily in the abstract machine itself, and the frontend we wrote for it was
+kept as simple as possible to the extent of having become useless beyond
+providing access to the CAM's internals. The intent of this project was not to
+learn about Hindley-Milner type inference or language design, and it shows.
+
+\section{$\lambda$-calculus}\label{lambda}
+The primary syntactic unit around which much of mathematical discourse revolves
+is arguably that of an expression. We encounter them in such simple algebraic
+compositions as
+$$ (y - 2) + z $$
+ranging to the more involved musings of calculus and beyond,
+$$ \sum_{n=0}^{\infty}r^n $$
+$$ \int_a^bx^2dx $$
+Already from this small number of examples, we can make several observations:
+\begin{itemize}
+\item Expressions are built by applying operators like $+$ or $\sum$ to
+operands, the latter expressions themselves. Fueling this recursion are any
+constants, like numbers, or, leading into our next two observations, variables.
+\item Expressions may contain free variables, like $a$, $b$, $z$, $y$ and $r$
+above, usually interpreted within the wider context as being universally
+quantified.
+\item Expressions may contain bound variables, like $n$ and $x$ above. In fact,
+free variables may be considered bound as well by the implicitly understood
+universal quantifiers at the level of the surrounding discourse.
+\end{itemize} Variable binding and the operator/operand dichotomy pervade
+mathematical notation, and a closer analysis of their subtleties will yield
+conclusions that similarly apply across the board. For instance, what are we
+to make of two expressions differing only by a renaming of some bound variable?
+E.g., as with $\sum_{i=1}^k i$ and $\sum_{j=1}^k j$? The distinction certainly
+seems inconsequential, but then how about $\sum_{i=1}^2\sum_{j=1}^3 i+j$ and
+$\sum_{j=1}^2\sum_{j=1}^3 j+j$? The second expression arises from the former by
+renaming the variable bound by the inner sum, but the results of their
+evaluation differ. The point is that we shall want to address these and similar
+questions once and for all, as opposed to returning to them time and again
+whenever some new variable-binding construct is proposed. Put more ambituously,
+we shall seek a method of analysis that reduces any expression to the
+application of a small number of primitive notions, on the basis of which such
+questions as raised above may be fruitfully investigated independently of any
+one particular branch of applied mathematics.
+
+The challenge put forth in the previous paragraph was met by Alonzo Church in
+the 1930's with his invention of the $\lambda$-calculus (a recent survey of
+which may be found in S{\o}rensen et al. \cite{sorensen2006}), named after the
+notational device it uses for denoting variable bindings. Roughly, Church put
+forth a notion of expression that we shall henceforth refer to by \emph{terms},
+and which in themselves suffice for subsuming much of the more commonly
+encountered writings in math. Proceeding informally, terms, together with the
+closely related concepts of free and bound variable occurrences, may be defined
+by induction as follows:
+
+\begin{itemize}
+\item[0.] Any \emph{constant} is a term, where by a constant we may understand
+not only, e.g., symbolic representations of numbers, but also such writings
+as commonly associated with operators, like, e.g., $+$, $\sum$, $\int$, etc.
+
+\item[1.] Assuming some countably infinite voculary of symbols distinct from
+those used for constants, every \emph{variable} $x$ drawn therefrom is a term,
+with any such occurrence by itself being considered free.
+
+\item[2.] If $t,s$ are terms, so is their \emph{application} $(t \ s)$, with
+all free variable occurrences in $s,t$ separately likewise occurring free in
+$(s \ t)$.
+
+\item[3.] If $t$ is a term and $x$ a variable, so the \emph{abstraction}
+$(\lambda x.t)$ is a term, where all free occurrences of $x$ in $t$ are now
+deemed bound in $(\lambda x.t)$.
+\end{itemize}
+Before demonstrating the practical application of these definitions, we first
+draw attention to our emphasis on free- and bound \emph{occurrences} of
+variables. For instance, in
+$$ ((\lambda x. x) \ x) $$
+the variable $x$ has two occurrences outside of its appearance right after
+$\lambda$, with one being bound and the other free.
+
+The key to understanding how our previous expressions from algebra and calculus
+may be represented by terms lies in the realization that in $\lambda$-calculus,
+traditional operators are treated as constants, rendering the combination with
+operands through (repeated) application, while reducing all forms of variable
+binding to abstraction. To illustrate,
+\begin{center}
+\begin{tabular}{r c l}
+$(y - 2) + z$ & $\sim$ & $((+ \ (- \ y \ 2)) \ z)$ \B \\ 
+$\sum_{n=0}^{\infty}r^n$ & $\sim$ &
+$(((\sum \ 0) \ \infty) \ (\lambda n.((\uparrow \ r) \ n)))$ \T\B \\
+$\int_a^bf(x)dx$ & $\sim$ & $(((\int \ a) \ b) \ (\lambda x.f(x)))$ \T
+\end{tabular}
+\end{center}
+If we agree that applications associate to the left, and ommitting the brackets
+surrounding abstractions wherever this does not lead to confusion, these may be
+rendered somewhat more intelligibly:
+$$ (+ \ (- \ y \ 2) \ z) $$
+$$ (\sum \ 0 \ \infty \ \lambda n.(\uparrow \ r \ n)) $$
+$$ (\int \ a \ b \ \lambda x.f(x)) $$
+Landin \cite{landin1964} offers many more illustrations of how familiar
+constructs from both the languages of mathematics and of computer science may
+be adequately rendered by $\lambda$-terms, discussing as well criteria for
+judging the faithfulness of such translations. In the sections to follow we
+shall encounter several more of Landin's examples, though for now the above
+introduction should suffice. Our main concern in the sequel, however, shall be
+the \emph{evaluation} of terms, i.e., a process similar to that by which, say,
+the expression $1 + 1$ from arithmetic yields $2$. In fact, the very purpose
+of the abstract machine proposed by Cousineau et al. is precisely to formulate
+such a procedure that applies to $\lambda$-terms in general, and hence to all
+specific expressions that may be encoded thereby, be they from logic,
+programming, calculus, etc.
+
+\section{Literate programs}\label{literate}
+The current document constitutes a \emph{literate program}, in the sense that
+it has been generated from the same sources containing the code that it
+describes. Literate programming was introduced by Knuth \cite{knuth1984}, who
+called for a shift in thinking about the writing of code towards the art of
+explaining others what we desire the computer to do, as opposed to a mere
+isolated interaction with the machine. For our own purposes, we have embraced
+this practice as a method of study. It has often been said that true
+understanding is contingent on the ability to explain. As such, in desiring to
+learn some new topic, we might do well to articulate the evolution in our
+thought processes along the way, thus forcing ourselves to mentally deconstruct
+whichever narrative we have chosen to serve as our study materials, and
+rebuilding it from the ground up in a way that seems most meaningful to
+ourselves. The act of focus required by such a process will no doubt go a long
+way towards attainment of the understanding that we seek.
+
+Various toolings have been developed for enabling literate programming, there
+for a long time having existed a tight coupling with individual languages. This
+changed with the introduction of \textsc{noweb} by Ramsey \cite{ramsey1993},
+fueled by the design goal of offering a simple language-agnostic interface that
+would not get in the way of the programmer. \textsc{noweb} has since been
+applied in various projects, among which a production-quality C compiler
+\cite{fraser1995} and a general-purpose library for the C programming language
+\cite{hanson1996}.  The latter two sources having served as our main source of
+inspiration in composing this document, the choice for \textsc{noweb} was
+easily made.
+
+For the remainder of this section, we shall discuss some of the capabilities
+offered by literate programming. Its primary device is the ability to present
+code in a different order than required for consumption by a compiler, born
+from an observed discrepancy with the optimal sequencing of thoughs typically
+required by the human mind for attaining comprehension. The author is thus free
+to reshuffle the contents of his program in whichever way best aids his
+explanations. To illustrate, consider the task of writing a lexer for some
+programming language. Typically, these consist of a single big hairy method for
+requesting the next token from an input stream. To keep things simple, let's
+say we are parsing expressions from arithmetic, built from integers using the
+operations of addition, multiplication, subtraction and division. We shall
+first create a header for collecting all public declarations. As is common
+practice, we will use internal include guards to prevent it from being included
+more than once.
+
+<<lex.h>>=
+#ifndef LEX_H_
+#define LEX_H_
+
+<<lex.h typedefs>>
+<<lex.h function prototypes>>
+
+#endif /* LEX_H_ */
+
+@ A literate program, in \textsc{noweb}'s view, is a collection of
+\emph{chunks}, be they \emph{code} chunks, like the above, or
+\emph{documentation} chunks, like the current paragraph. Each code chunk has a
+name, such as \textit{lex.h}, and may mention other code chunks, e.g.,
+\textit{lex.h typedefs}, or \textit{lex.h function prototypes}.
+
+We need distinguish but a few token types, to wit (say, integral) numbers,
+brackets, and the usual arithmetic operations. In addition, a sentinel is added
+to the mix for signaling the end of the input stream. We capture these ideas in
+a type definition, filling in the first of the referenced code chunks in
+\textit{lex.h}.
+
+<<lex.h typedefs>>=
+typedef enum {
+  EOS = 0,      /* end of stream */
+  INT = 1,      /* integer */
+  LBRACK = 40,  /* '(' */
+  RBRACK = 41,  /* ')' */
+  MULT = 42,    /* '*' */
+  PLUS = 43,    /* '+' */
+  MINUS = 45,   /* '-' */
+  DIV = 47      /* '/' */
+} type_t;
+
+@ Note that except for [[INT]] and [[EOS]], all types describe single-character
+strings. To make our lives easier later, we have defined these by the
+corresponding ASCII values. Moving on to the interface for getting the next
+token, we shall again simplify matters by ignoring the matched token string and
+returning only the recognized type, as well as by assuming the input stream to
+coincide with standard input.
+
+<<lex.h function prototypes>>=
+extern type_t GetToken(void);
+
+@ With our interface clear, we can proceed to its implementation.
+
+<<lex.c>>=
+<<lex.c includes>>
+<<lex.c function definitions>>
+
+@ In practice, we shall always reserve the topmost include in a [[.c]] file
+for the associated header, thus ensuring the latter is self-contained.
+
+<<lex.c includes>>=
+#include "lex.h"
+
+@ This brings us to the main attraction. [[GetToken]] tries to determine the
+type of token that it is reading based on the first non-whitespace character,
+while signalling an error if unsuccessful.
+
+<<lex.c includes>>=
+#include <ctype.h>
+
+<<lex.c function definitions>>=
+type_t
+GetToken(void)
+{
+  int c;  /* next input character */
+
+  /* skip whitespace */
+  while (isspace(c = getchar()))
+    ;
+
+  switch (c) {
+  <<lex.c cases>>
+  default:
+    <<lex.c error handling>>
+  }
+}
+
+@ Note that the first of the code chunks above shares its name with another
+one defined before. As indicated by the additional $+$ symbol, we interpret
+the second one as being appended to the first.
+
+Before getting into the more serious cases, let us not forget to handle the
+end of the input stream.
+
+<<lex.c cases>>=
+case EOF:
+  return EOS;
+
+@ Recall that we defined those token types describing single characters by the
+latter's ASCII value, motivating the following straightforward implementation:
+
+<<lex.c cases>>=
+case '+': case '-': case '*': case '/': case '(': case ')':
+  return c;
+
+@ This still leaves the recognition of integers:
+
+<<lex.c cases>>=
+case '0': case '1': case '2': case '3': case '4': case '5':
+case '6': case '7': case '8': case '9':
+  while (isnum(c = getchar()))
+    ;
+  if (c != EOF) {
+    ungetc(c, stdin);
+  }
+  return INT;
+
+@ Note that the last character read will be one too many if not [[EOF]],
+requiring us to push it back on the input stream. Finally, if the first
+non-whitespace character that we read is not already covered by the above
+cases, we print an error message and crash hard, not wishing to bother with
+proper error handling for this simple example:
+
+<<lex.c includes>>=
+#include <stdio.h>
+
+<<lex.c error handling>>=
+fprintf(stderr, "Unexpected character: %c\n", c);
+exit(1);
+
+@ \section{Coding conventions}\label{conventions}
+The web abounds with coding conventions for the C programming language, there
+seemingly being no de-facto standard. The current section records the author's
+attempt at distilling from several such proposals a single set of guidelines
+for use in private projects. In general, wherever applicable the style guides
+published online by Google and ID Software have been followed, though with
+several deviations, most notably with regard to naming conventions for 
+variables.
+
+@ \subsection{File structure}
+At the project level, modularity in C may be achieved through a method
+advocated by Hanson \cite{hanson1996} for separating interfaces from their
+implementations, growing out of his previous joint work with Fraser
+\cite{fraser1995}. Roughly, given a module, say, [[foo]], its interface,
+as embodied by a header [[foo.h]], contains declarations for the types it
+defines as well as for the operations permitted thereupon. 
+
+@
+
+<<foo.h>>=
+#ifndef FOO_H_
+
+<<includes>>
+/* defines */
+/* typedefs */
+/* enums */
+/* structs */
+/* unions */
+/* extern global variable declarations */
+/* function prototypes */
+
+#endif /* FOO_H_ */
+
+@ To prevent the header's multiple inclusion in a project, its contents are
+wrapped inside what are commonly called internal include guards. The
+corresponding implementation is contained in [[foo.c]]:
+
+<<foo.c>>=
+#include "foo.h"
+<<includes>>
+/* defines */
+/* global variable definitions */
+/* static function prototypes */
+/* function definitions */
+
+@ As per the Google style guide, we shall want [[foo.h]] to be self-contained,
+so guaranteed by insisting on its topmost inclusion in [[foo.c]]. The order
+of the remaining includes in both interface and implementation is furthermore
+constrained as follows:
+
+<<includes>>=
+/* POSIX headers */
+/* C standard library headers */
+/* one's own project's headers */
+
+@ In the above, we deviated in one important respect from Hanson. Arguably the
+cornerstone of his proposal, the separation between interface and
+implementation allows the former to hide the latter's representation
+details through use of opaque pointers. Thus, any change in such internals may
+leave the header untouched, preventing files depending thereon from having to
+be recompiled. Here, we instead chose to collect \emph{all} [[typedef]]s,
+[[enum]]s, [[union]]s and [[struct]]s in headers, mostly to enjoy direct
+property access, though at the cost of tighter coupling. While we continue to
+speak of interfaces and their implementations, it should thus be noted that our
+use of this terminology does not strictly follow Hanson's (if not constituting
+a case of straight-out blasphemy).
+
+@ \subsection{Naming}
+The following rules apply to the naming of identifiers:
+\begin{itemize}
+\item[0.] Function names are verbs written in [[UpperCamelCase]].
+\item[1.] Typenames, comprising [[typedef]]s and [[struct]]-, [[enum]]- and
+[[union]] tags, are noun phrases written in [[lowerCamelCase]].
+\item[2.] Variable names are nouns written in [[lower_snake_case]].
+\item[3.] Compile-time constants, whether part of an [[enum]] or [[#define]]d,
+are written in [[UPPER_SNAKE_CASE]], with the exception of function macro's,
+which are held to the same rules as stipulated for function names.
+\end{itemize}
+Names commonly chosen for variables are [[it]] (for iterators) and [[me]] (for
+method parameters of the type exported by an interface, akin to [[this]] in
+C++ and Java). While at its core C provides no facilities for organizing one's
+identifiers into namespaces, we can compensate by augmenting the above rules
+with the following: 
+\begin{itemize}
+\item[0'.] Function names exposed through an interface [[foo]] are prefixed by
+[[Foo_]].
+\item[1'.] [[typedef]]s, [[struct]]-, [[enum]]- and [[union]] tags are
+postfixed by [[_t]], [[_s]], [[_e]] and [[_u]], respectively.
+\item[2'.] Global variables are prefixed by [[g_]].
+\item[3'.] Identifiers defined as part of include guards are postfixed by
+[[_H_]].
+\end{itemize}
+In general, we prepare the use of an [[enum]] over a [[#define]] for
+compile-time integral constants.
+
+\subsection{Whitespace}
+Each variable declaration is written on its own line, with identation applied
+in order to align variable names. In particular, [[*]] and [[const]] are
+considered part of the type. E.g.,
+
+<<variable declaration example>>=
+const char    foo;
+char * const  bar;
+
+@ \subsection{Braces}
+The following rules govern the use of curly braces:
+\begin{itemize}
+\item[0.] Braces are mandatory for statement blocks following [[if]], [[else]],
+[[for]], [[do]] and [[while]], except when empty and following [[for]] or
+[[while]], in which case a single properly indented occurrence of [[;]] on a
+separate line suffices.
+\item[1.] An opening brace is to be followed by a line break. If following a
+keyword introducing a control structure, it is to appear on the same line.
+Otherwise, if following a method declaration, it is to appear immediately
+preceded by a line break.
+\item[2.] A closing brace if to appear after a line break, being optionally
+followed by [[else]], or by a line break otherwise.
+\end{itemize}
+
+\section{Overview}\label{overview}
+Table \ref{files} presents an overview of the project as a whole, naming its
+modules in their order of presentation, together with their decomposition into
+interfaces and implementations.
+\begin{table}
+\begin{center}
+\begin{tabular}{llll}\hline
+\textbf{Module} & \textbf{Interface} & \textbf{Implementation}
+& \textbf{Section} \T\B \\ \hline
+Circular linked lists & [[node.h]] & [[node.c]] & \S\ref{section:lists} \T \\
+Fixed-Size Memory pools & [[pool.h]] & [[pool.c]] & \S\ref{section:pools} \\
+Exceptions & [[except.h]] & & \S\ref{section:exceptions} \\
+Abstract syntax trees & [[ast.h]] & [[ast.c]] & \S\ref{section:ast} \\
+Environments & [[env.h]] & [[env.c]] & \S\ref{section:env} \\
+Interpreter & [[cam.h]] & [[cam.c]] & \S\ref{section:cam} \\
+Optimizer & [[optim.h]] & [[optim.c]] & \S\ref{section:optim} \\
+Lexer & [[lexer.h]] & [[lexer.c]] & \S\ref{section:lexer} \\
+Parser & [[parser.h]] & [[parser.c]] & \S\ref{section:parser} \\
+Read-Eval-Print Loop & & [[main.c]] & \S\ref{section:repl} \B \\ \hline
+\end{tabular}
+\end{center}
+\caption{An overview of the files making up our implementation of the CAM.}
+\label{files}
+\end{table}
+
+The main design decision that had to be settled prior to commencing work on
+this project concerned which data structures to use. Wherever possible we
+preferred simple linked allocation schemes, motivating the start of our
+discussion with the circular linked lists that lie at the basis of many of our
+algorithms. Most notably they feature prominently in the implementation of
+fixed-size memory pools, replacing the C standard library's [[malloc]] and
+[[free]] on account of the observation that we shall need but three different
+object sizes to be allocated on the heap. Both circular linked lists as well
+as memory pools are discussed at considerable length by Knuth \cite{knuth1997},
+and our treatments thereof borrow much from his work.
+
+We continue with an account of how $\lambda$-terms are represented in-memory.
+It turns out that while the use of symbolic identifiers for denoting variables
+aids comprehension by the human mind, less benefit can be claimed when terms so
+represented are to be manipulated by machine. In particular, such an endeavour
+would quickly run into problems concerning the conditions under which two terms
+differing only by a renaming of variable occurrences may be identified. Though
+questions worthwile of study, as we indeed argued before, they nonetheless
+primarily constitute artifacts of the choice of representation and need not
+clutter our computations. Thus, prior to their evaluation, we shall first
+transform terms into a 'nameless' form better amenable to computation, more
+precisely replacing its variables with numeric identifiers indicating their
+distance to the binding $\lambda$. First presented by De Bruijn
+\cite{debruijn1972}, his was not the first proposal for dispensing with bound
+variable names. Without going into much detail, earlier efforts had
+concentrated on eliminating abstractions in favour of a number of combinators,
+essentially higher-order functions, that could be combined using application
+(see, e.g., Curry et al. \cite{curry1972} for an overview). It was Curien
+\cite{curien1985} who realized that De Bruijn's representation could itself be
+understood as a language of combinators, having approached it from the
+perspective of yet another branch of research, to wit category theory. Often
+lovingly dubbed 'abstract mathematical nonsense' by its practicioners, the
+latter's main concern has grown to encompass a paradigmatic shift in
+mathematical thinking that extends deep into foundational studies.  Luckily,
+our own dealings with category theory in the chapters to come will carry us
+considerably less far afoot. Curien's combinatorial rephrasing of De Bruijn's
+proposals may be considered what is often referred to in the computer science
+literature by an \emph{abstract syntax} for $\lambda$-terms, constituting a
+means of representation free of the peculiarities that go with their more usual
+\emph{concrete} rendering for the human eye, such as concerning variable
+renaming. It is, in essence, Curien's proposal that we shall use for our own
+in-memory representation of terms as well.
+
+Curien's efforts lead directly to the invention of the Categorical Abstract
+Machine in joint work with Cousineau and Mauny \cite{cousineau1985}, and we
+shall present its implementation as a traversal over abstract syntax trees. In
+essence, its workings capture the computational process of \emph{evaluating} a
+term, in the sense of obtaining from it the value that it denotes. Much like
+how the interpretation of an utterance depends on context, so in fact the
+evaluation of a term takes place inside an \emph{environment}. More precisely,
+by the latter we shall understand a \emph{binding} of the term's free variable
+occurrences to concrete values, it hopefully being not too far a stretch of the
+imagination that any choices made in this regard might affect the outcome of
+determining the value for a term as a whole. It should be noted at this point
+that Cousineau et al. used a slightly different terminology, referring by
+terms to what we have here called environments.
+
+Besides \emph{evaluating} a term, we can sometimes also \emph{transform} it
+without changing the value that it denotes. To illustrate using our concrete
+syntax, it should be clear that $((\lambda x.(+ \ x \ 1)) \ 2)$ and
+$(+ \ 2 \ 1)$ both evaluate to $3$. Though thus far having largely remained
+silent ont this topic, evaluating and transforming a term may really be
+considered two sides of the same coin, with much of the theory of
+$\lambda$-calculus having in fact been devoted to a systematic investigation
+into the properties of such syntactic rewritings. For our purposes, we may
+implement them as optimization passes over our abstract syntax trees prior to
+evaluating them, in so doing following a proposal by Cousineau et al.
+
+Having described a means of representing $\lambda$-terms in memory in a form
+amenable to both their further transformation and ultimate evaluation, the
+'backend' of our work is complete. What remains is the 'frontend' task of
+writing a lexer and parser that transforms a human-readable representation
+of $\lambda$-terms into abstract syntax trees. From the outset we made a
+conscious decision to keep this part of the work as simple as possible, seeing
+as our motivation in starting this project largely concerned the CAM. Thus,
+we shall provide little more than a proof of concept for our implementation of
+the latter, presenting a restricted subset of the $\lambda$-calculus capable,
+through the addition of appropriate constants, of doing some simple arithmetic.
+Finally a REPL is thrown in to enable the user to present closed instances of
+such terms (i.e., without any free variable occurrences), which are then fed
+to the optimizer and evaluator. This concludes our work.

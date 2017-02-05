@@ -1,0 +1,578 @@
+@ \chapter{Evaluating $\lambda$-terms}
+Having laid the groundwork for building linked data structures and managing
+their lifecycle, we continue with the most data-heavy part of our exposition.
+Specifically, we will start in \S\ref{section:ast} with a discussion of our
+in-memory representation for $\lambda$-terms, allowing us to abstract away from
+the peculiarities surrounding named variables. In the subsequent two sections
+\S\ref{section:env} and \S\ref{section:cam}, we discuss environments, resp. the
+evaluation of a term relative to a given environment. \S\ref{section:optim}
+concludes with a number of optimizations that may be applied to a term prior to
+its evaluation.
+
+\section{Abstract Syntax Trees}\label{section:ast}
+Whereas the previous chapter limited its discussion of data structures to the
+one dimensional by sticking to linked lists, in the current we will expand into
+two with the definition of trees. As is becoming a recurring theme by now, we
+base ourselves largely on the work of Knuth \cite{knuth1997}, specifically his
+representation of forests by binary trees.
+
+\subsection{Interface}
+The AST module (for Abstract Syntax Tree) exports declarations both for a
+tree-based in-memory representation of $\lambda$-terms (named, unsurprisingly,
+AST's), as well as for a means to specify what logic to apply during the visits
+of individual nodes as part of a tree traversal. The latter device will in
+particular be used later for implementing the evaluation and optimization of
+terms.
+
+<<ast.h>>=
+#ifndef AST_H_
+#define AST_H_ 
+
+#include <stdarg.h>
+#include <stdbool.h>
+
+#include "node.h"
+
+<<ast.h macros>>
+<<ast.h typedefs>>
+<<ast.h structs>>
+<<ast.h function prototypes>>
+
+#endif /* AST_H_ */
+
+@ The nodes of an abstract syntax tree may contain any arbitrary number of
+children. This complicates their definition, compared to, say, that of a binary
+tree, although the increased generality will make our lifes easier in other
+respects later on. To be clear, we use the word `node' in what is to follow to
+refer to abstract syntax trees wherever confusion does not arise with its
+previous usage for cyclic linked lists. That said, we shall see presently that
+a node in the current sense may be regarded as a specialization of a list.
+
+<<ast.h typedefs>>=
+typedef struct ast_s ast_t;
+
+@ The children of a node are accessed through a pointer [[rchild]] to its
+rightmost one, heading a cyclic linked list. We make the list structure part of
+the definition of a node by having it extend [[node_t]], whose [[link]] field
+here thus acts as a pointer to a node's right sibling.
+
+<<ast.h structs>>=
+struct ast_s {
+  node_t    base;
+  ast_t *   rchild;
+  <<ast\_s fields>>
+};
+
+@ We distinguish between several types of nodes, each corresponding (for the
+most part) to a construct of the source language, i.e., $\lambda$-terms in the
+usual named notation. In one case, this happens to be an integral constant,
+requiring storage in a field of its own.
+
+<<ast\_s fields>>=
+int       value;
+astType_t type;
+@
+When evaluating a term, its free variables represent unknowns. We thus have
+no choice but to parameterize over their denotations if we are to come up with
+a value for the term as a whole. We can make these remarks more explicit by
+introducing the concept of a binding environment. Though we will flesh out its
+definition over the coming paragraphs, for now it suffices to consider it as
+representing a choice of denotations for a term's free variables. A term itself
+we may then represent by a function over such a binding environment, s.t. the
+computation thereof for some argument corresponds to the term's evaluation. An
+AST, in turn, is simply an algebraic description of such a function. Its leafs,
+in particular, correspond to functions that we may treat as `primitive' for our
+purposes, whereas intermediate nodes constitute operators acting on existing
+functions (i.e., as represented by its children) for deriving new ones. The
+\emph{type} of a node tells us which primitive function or operator it denotes.
+
+<<ast.h typedefs>>=
+typedef enum {
+  <<leaf node types>>
+  <<parent node types>>
+} astType_t;
+
+@ One way in which to combine functions is by composing them. Specifically, if
+$f,g$ are functions s.t. $f$'s codomain is a subset of $g$'s domain, then we
+define their composition $(g\mathbin{\circ}f)$ by $(g\mathbin{\circ}f)(x)=
+g(f(x))$. One way to understand this is as a \emph{substitution} of $f(x)$ for
+$x$ in $g$. Function composition is associative, and we will represent
+$(f_n\circ\dots\circ f_1)$ by a node of type [[AST_COMP]] whose children,
+from left to right, represent $f_1,\dots,f_n$. 
+
+<<parent node types>>=
+AST_COMP,
+@
+Viewed algebraically as a binary operation on functions, composition has an
+identity `element' \textit{Id} s.t. $\textit{Id}(x)=x$, represented by a leaf
+node of type [[AST_ID]], meaning $(f\mathbin{\circ}\textit{Id})=
+(\textit{Id}\mathbin{\circ}f)=f$.
+
+<<leaf node types>>=
+AST_ID,
+@
+Besides composing then, functions can also be \emph{paired}. Specifically,
+if $f,g$ are functions with the same domain, $\langle f,g\rangle$ is defined
+by $\langle f,g\rangle(x)=(f(x),g(x))$, where $(u,v)$ is an ordered pair of
+elements $u,v$ in the set-theoretic sense.
+
+<<parent node types>>=
+AST_PAIR,
+@
+Using pairing and composition, we can define the representation for an
+application $(s \ t)$. If the terms $s,t$ are represented by functions $s',t'$
+resp., then $\langle s', t'\rangle$ enables independent evaluation of $s$ and
+$t$ w.r.t. any binding environment $\Gamma$, recording the results in an
+ordered pair $(s'(\Gamma),t'(\Gamma))$. If we define a function \textit{App},
+encoded by a leaf node of type [[AST_APP]], s.t. $\textit{App}(u,v)=u(v)$, we
+can pass it our intermediate result $(s'(\Gamma),t'(\Gamma))$ to obtain the
+desired function application $s'(\Gamma)(t'(\Gamma))$ for evaluating $(s \ t)$
+within the binding environment $\Gamma$.
+
+<<leaf node types>>=
+AST_APP,
+@
+Though the first chapter presented the $\lambda$-calculus as a means of
+unifying a wide range of notations used across different subfields of
+mathematics, our ambitions as to its current implementation are less
+far-reaching. We shall in particular stick to the non-negative integers $n$ for
+our domain of discourse, which we may each represent by a \emph{constant}
+function $'n$, i.e., s.t. always $('n)(\Gamma)=n$. The mapping taking an
+integer to its corresponding constant function is referred to by Cousineau et
+al. \cite{cousineau1985} as \emph{Quoting}.
+
+<<leaf node types>>=
+AST_QUOTE,
+@
+To narrow down the scope of this work even further to little more than a
+proof of concept, we shall consider but a single operation from arithmetic,
+specifically addition. If so desired, the reader should find little challenge
+in building forth on our current efforts to enable support for other operations
+as well.
+
+<<leaf node types>>=
+AST_PLUS,
+@
+So far, we had little to say about what defines a binding environment,
+instead contending ourselves with a sense of its intended purpose. On first
+approximation, we may think of it as a mapping from variable names to values.
+We can do better, however, by keeping only the values and replacing variable
+names in a term with addresses , serving as instructions for looking up a
+denotation inside an environment. Specifically, let an environment be a tuple
+$(v_1,\dots,v_n)$ of values $v_1,\dots,v_n$ for arbitrary $n$. A variable may
+then be represented by a \emph{projection} function $\pi_i$ for some
+$1\leq i\leq n$, s.t. $\pi_i(v_1,\dots,v_n)=v_i$. In practice, we shall admit
+only ordered pairs instead of arbitrary tuples, so that $(v_1,\dots,v_n)$ is to
+be understood as abbreviating $(((v_1,v_2),\dots),v_n)$. A projection $\pi_i$,
+in turn, is decomposed as $\textit{Snd}\circ\textit{Fst}^{n-1}$, where
+\textit{Fst} and \textit{Snd} are the first- and second projections 
+respectively, and $\textit{Fst}^{n-1}$ means the composition of $n-1$ times
+\textit{Fst}.
+
+<<leaf node types>>=
+AST_FST,
+AST_SND,
+@
+Though the notion of environment was specialized to an ordered tuple of
+values, we have not been precise as to what a value \'is, other than treating
+it intuitively as something that may result from evaluating a term. We will in
+fact require only two types of values, the first obviously being non-negative
+integers. The second, in turn, will reveal itself upon a closer examination of
+the in-memory representations for abstractions. What to make of $(\lambda x.t)$
+if the AST for $t$ has replaced all names with addresses (i.e., compositions
+$\textit{Fst}^{n-1}\circ\textit{Snd}$)? The question, of course, is what
+address was substituted for $x$? If we systematically encode bound variables
+$u$ by projections $\pi_i$ for $i$ the number of $\lambda$'s seen when
+traveling up the parse tree until $\lambda u$ is first encountered, then it
+follows that all free occurrences of $x$ in $t$ must have been replaced with
+\textit{Snd}. As such, $(\lambda x.t)$ becomes a mapping from environments
+$\Gamma$ to that function which, when applied to a value $v$, returns
+$t'(\Gamma,v)$, for $t'$ the AST of $t$. But this is simply the Curried form
+of $t'$, which we will write $\Lambda(t')$. Now notice that, contrary to the
+value of, e.g., an integral constant, the result of evaluating $(\lambda x.t)$
+in an environment $\Gamma$ is not a number but instead a \emph{function}
+$\Lambda(t')(\Gamma)$. This, then, is the second type of value that we shall
+recognize, referring to it by a \emph{closure}.
+
+<<parent node types>>=
+AST_CUR
+@
+Knowing now what AST's look like, we move on to instantiating them. The
+Standard Library offers facilities for writing variadic functions, enabling us
+to pass in (in left-to-right order) an arbitrary number of children. In
+addition, we shall need to know the node type, as well as how many children
+there are.
+
+<<ast.h function prototypes>>=
+extern ast_t * Ast_New(const astType_t, int, ...);
+@
+The above method puts no restrictions on the node type or on the number of
+children that are passed in. We can specialize its application for particular
+types using the definitions below, noting the use of a variadic macro in case
+of compositions.
+
+<<ast.h macros>>=
+#define Ast_Id()               Ast_New(AST_ID, 0)
+#define Ast_Fst()              Ast_New(AST_FST, 0)
+#define Ast_Snd()              Ast_New(AST_SND, 0)
+#define Ast_App()              Ast_New(AST_APP, 0)
+#define Ast_Cur(child)         Ast_New(AST_CUR, 1, (child))
+#define Ast_Pair(left, right)  Ast_New(AST_PAIR,2,(left),(right))
+#define Ast_Comp(cnt, ...)     Ast_New(AST_COMP,(cnt),__VA_ARGS__)
+
+@ The above macros do not yet create instances for nodes of types [[AST_QUOTE]]
+or [[AST_PLUS]]. These, instead, we will create by means of specialized methods.
+In case of [[AST_QUOTE]], we parameterize over an integer, whereas for reasons
+to be described later, functional constants like addition are represented by
+compound AST's as opposed to a single node of the required type (i.e., here
+[[AST_PLUS]]).
+
+<<ast.h function prototypes>>=
+extern ast_t * Ast_Quote(const int);
+extern ast_t * Ast_Plus(void);
+@
+Sometimes, we may not know in advance which and/or how many children to add
+to a node. For these situations, we offer macros to create a node initially
+without children, and to either add these later one by one from right to left,
+or to set them all at once using a pre-built list.
+
+<<ast.h macros>>=
+#define Ast_Node(type)               Ast_New((type), 0)
+#define Ast_AddChild(me,child)       Push(&(me)->rchild,(child))
+#define Ast_SetChildren(me,children) (me)->rchild = (children)
+
+@ Rather than leaving it to the client to clean up an AST one node at a time,
+we will instead export a method for releasing an entire tree all at once. By
+taking an argument of type [[ast_t **]], we can reset the client's reference to
+[[NULL]], preventing dangling pointers. It should be noted that if the node
+referred to by the argument has itself any siblings, then these will not be
+touched.
+
+<<ast.h function prototypes>>=
+extern void    Ast_Free(ast_t ** const);
+@
+We will use tree walks both for evaluating terms as well as to optimize them
+in advance. As such, we want to define the logic for traversing an AST only
+once, abstracting over the actions that are to be applied upon visiting each
+type of node. This separation of a composite data structure from the operations
+that may be performed thereon is precisely achieved by the Visitor Pattern,
+familiar from Object-Oriented languages and described, e.g., by Johnson et al.
+\cite{johnson1995}. Over the next paragraphs we will explain the concept of a
+visitor and walk through its realization in C step by step, starting from the
+following definition.
+
+<<ast.h typedefs>>=
+typedef struct visit_s visit_t;
+
+@ We shall now require a tree traversal to parameterize both over the root node
+from which to commence, as well as over a visitor, containing the actions to
+apply to the individual nodes encountered along the way.
+
+<<ast.h function prototypes>>=
+extern void    Ast_Traverse(const ast_t * const, visit_t * const);
+
+@ Before proceeding, we will first define a means for our custom actions to
+provide the tree walker that applies them with feedback, telling it how to
+proceed through the return of a status code. In most cases we can simply let it
+continue, although on occasion we shall want it to skip the children of the
+node that was last visited.
+
+<<ast.h typedefs>>=
+typedef enum {
+  SC_CONTINUE,
+  SC_SKIP,
+} statusCode_t;
+
+@ An action we shall represent by a function pointer. That way, by changing its
+reference, we change the algorithm, achieving our desired separation. In a way
+to be made precise below, a visitor we may then consider a choice for a
+collection of such function pointers, one for each node type. As for the method
+signature of an action, it should come as no surprise to require at least for a
+reference to a concrete node to be passed in. In addition, we may want to keep
+track of state in between individual visits, storing it on the visitor itself
+alongside its actions. It follows that, conversely, an individual action should
+know about the visitor containing it, enabling it to access any required state.
+
+<<ast.h typedefs>>=
+
+typedef statusCode_t (*visitFunc_t)(visit_t * const, const ast_t *);
+
+@ We have alluded to the multiplicity of visitors, each representing a
+separate algorithm born from a different choice of actions, and possibly
+containing private state. We are describing polymorphism, i.e., the ability to
+refer to different types by a single shared interface. The latter, in this
+case, consists of simply the declarations for actions corresponding to visits
+of different node types during a tree traversal. While we could make these part
+of the definition for [[visit_s]], doing so would consume space for every
+single instance, even when some share the exact same choice of actions. To
+accommodate such sharing, we will instead separate them into a \emph{virtual
+function table}, as is a standard technique for realizing Object-Oriented
+programming in C.
+
+<<ast.h typedefs>>=
+typedef struct {
+  <<virtual functions>>
+} visitVtbl_t;
+
+@ During a tree traversal, every leaf is visited exactly once. Parent nodes, on
+the other hand, are seen more often, each time providing an opportunity for
+applying some action. In particular, we may visit them both prior as well as
+after having visited their children, speaking, resp., of pre- and postvisiting.
+In addition, a binary node may also be visited in between visiting its two
+children. If we declare an action for every opportunity for visiting any of our
+node types, we end up with the following list.
+
+<<virtual functions>>=
+visitFunc_t   VisitId;
+visitFunc_t   VisitApp;
+visitFunc_t   VisitQuote;
+visitFunc_t   VisitPlus;
+visitFunc_t   VisitFst;
+visitFunc_t   VisitSnd;
+visitFunc_t   PreVisitComp;
+visitFunc_t   PreVisitPair;
+visitFunc_t   PreVisitCur;
+visitFunc_t   InVisitPair;
+visitFunc_t   PostVisitComp;
+visitFunc_t   PostVisitPair;
+visitFunc_t   PostVisitCur;
+@
+We can now define a visitor simply by a pointer to a virtual function table.
+Specializations can be obtained in the same way that we did for the nodes of a
+circular linked list. I.e., seeing as a struct's address in C coincides with
+that of its first field, making the latter a [[visit_t]] allows for us to
+downcast the struct as a whole thereto.
+
+<<ast.h structs>>=
+struct visit_s {
+  const visitVtbl_t * vptr;
+};
+
+@ In practice, not every algorithm that we wish to express for an AST will
+utilize each visitor method. We therefore define a `default' implementation
+that simply does nothing, allowing us to initialize function pointers for
+unused actions therewith.
+
+<<ast.h function prototypes>>=
+extern statusCode_t VisitDefault(visit_t * const, const ast_t *);
+@
+\subsection{Implementation}
+
+<<ast.c>>=
+#include "ast.h"
+
+#include <assert.h>
+
+#include "pool.h"
+
+<<ast.c global variables>>
+<<ast.c function definitions>>
+
+@ The nodes of an AST have to be dynamically allocated, to which end we define
+a dedicated memory pool. By making the sizes of their backing arrays known at
+compile time, pools themselves are always of fixed capacity. More sophisticated
+implementations are possible where a pool can be dynamically grown as needed,
+although for the modest purposes of the program under consideration, the
+benefits of such an endeavour did not seem to outweigh the simplicity of the
+approach adopted currently.
+
+<<ast.c global variables>>=
+static ast_t  g_pool[N_ELEMS];
+pool_t        g_ast_pool = INIT_POOL(g_pool, N_ELEMS, ast_t);
+
+@ To create a new node, we specify both its type and its children. The latter
+can be of arbitrary number, passed in as a separate argument.
+
+<<ast.c function definitions>>=
+ast_t *
+Ast_New(const astType_t type, int cnt, ...)
+{
+  ast_t * me;
+  va_list argp;
+
+  <<allocate a new node [[me]] of the given [[type]]>>
+  <<add [[cnt]] child nodes>>
+  return me;
+}
+
+@ Recall that allocation from a memory pool first attempts to recycle
+previously freed nodes. The latter form a linked list, references to which may
+hence be retained as garbage in the returned object. By invoking
+[[Pool_Calloc]] instead of [[Pool_Alloc]], we make sure all the bits are
+cleared.
+
+<<allocate a new node [[me]] of the given [[type]]>>=
+me = Pool_Calloc(&g_ast_pool);
+me->type = type;
+
+@ We next count down from [[cnt]] in adding the new node's children, enqueuing
+them one by one to make sure that their order is retained.
+
+<<add [[cnt]] child nodes>>=
+va_start(argp, cnt);
+while (cnt-- > 0) {
+  Enqueue(&me->rchild, va_arg(argp, ast_t *));
+}
+va_end(argp);
+
+@ To create a new node of type [[AST_QUOTE]], we can proceed as above without
+adding any children, though now additionally having to specify a numeric value.
+
+<<ast.c function definitions>>=
+ast_t *
+Ast_Quote(const int value)
+{
+  ast_t * me;
+
+  me = Pool_Calloc(&g_ast_pool);
+  me->type = AST_QUOTE;
+  me->value = value;
+  return me;
+}
+
+@ We can make the arguments of a functional constant like [[+]] explicit by
+abstracting over them, resulting in an AST $\Lambda(+\circ\textit{Snd})$. In
+particular, note $\Lambda(+\circ\textit{Snd})(\Gamma)(m,n)$ evaluates to
+$+(m,n)$ for any environment $\Gamma$ and numbers $m,n$, as desired. Using this
+encoding will simplify the evaluation of applications later in allowing us to
+assume the operator to always be an abstraction, as opposed to having to make
+exceptions for functional constants.
+
+<<ast.c function definitions>>=
+ast_t *
+Ast_Plus(void)
+{
+  return Ast_Cur(Ast_Comp(2, Ast_Snd(), Ast_Node(AST_PLUS)));
+}
+
+@ To release the resources held by an AST, we first flatten it into a linked
+list that we can then deallocate all at once, as opposed to freeing each node
+individually. We can do so by starting with a list containing only the root
+node, and iterate through while at each step growing it at the end until all
+nodes have been seen.
+
+<<ast.c function definitions>>=
+static node_t *
+Flatten(ast_t *me)
+{
+  ast_t * it = me;
+
+  assert(me);
+
+  me->base.link = (node_t *)me;
+  do {
+    Append(&me, it->rchild);
+  } while <<there are more nodes to process>>;
+
+  return (node_t *)me;
+}
+
+@ At all times, the original root node oocupies the head of our list. Indeed,
+when we started out it was the \'only element, and hence both the first and the
+last, while every iteration at most adds nodes to the end. By a similar
+reasoning, we can ascertain [[me]] always points to the final element of the
+list. As such, we know we are done when advancing [[it]] gives us back
+[[Link(me)]].
+
+<<there are more nodes to process>>=
+((it = Link(it)) != Link(me))
+@
+We can now release an AST by flattening it into a list and deallocating the
+latter in its entirety. In doing so, we have to make sure not to touch the root
+node's siblings.
+
+<<ast.c function definitions>>=
+void
+Ast_Free(ast_t ** const me)
+{
+  assert(me);
+
+  if (*me == NULL) {
+    return;
+  }
+  Pool_FreeList(&g_ast_pool, Flatten(*me));
+  *me = NULL;
+}
+
+@ We move on to tree traversal, essentially consisting of a sequence of visited
+nodes. The actions to apply thereat we will invoke through an offset into a
+virtual function table, allowing us to take some shortcuts later on.
+
+<<ast.c function definitions>>=
+static inline statusCode_t
+Visit(const ast_t * const me, visit_t * const vp, const size_t offset)
+{
+  return (*((visitFunc_t *)vp->vptr)[offset])(vp, me);
+}
+
+@ Traditionally, one distinguishes between preorder-, inorder- and postorder
+tree traversals, depending on whether a node is visited prior, in between,
+or after traversing its children. Considering the difference a property of
+whichever algorithm is being applied, we have exposed callback methods for
+each of these opportunities on the visitor interface, leaving it to the
+implementor to decide which to associate with a concrete action.
+
+<<ast.c function definitions>>=
+void
+Ast_Traverse(const ast_t * const me, visit_t * const vp)
+{
+  ast_t *       ap;
+  statusCode_t  sc;
+
+  assert(me);
+  assert(vp);
+
+  <<previsit>>
+  <<traverse children>>
+  <<postvisit>>
+}
+
+@ Given a node, we can switch on its type to decide which visitor method to
+call. However, by having carefully arranged the declaration orders both of the
+enum constants defining AST types, as well as of the visitor methods, we can
+more quickly use the former as an offset into a virtual function table to find
+the function pointer for performing the corresponding (pre)visit.
+
+<<previsit>>=
+sc = Visit(me, vp, me->type);
+
+@ Provided a node's previsit did not return [[SC_SKIP]], we next recursively
+traverse its children, if any. A minor complication arises if we are dealing
+with a pair, in which case we have to call [[InVisitPair]] after having walked
+its first child.
+
+<<traverse children>>=
+if (sc == SC_CONTINUE && (me->rchild)) {
+  ap = Link(me->rchild);
+  Ast_Traverse(ap, vp);
+  if (me->type == AST_PAIR) {
+    Visit(me, vp, 9); /* InVisitPair */
+  }
+  while ((ap = Link(ap)) != Link(me->rchild)) {
+    Ast_Traverse(ap, vp);
+  }
+}
+
+@ For a node's postvisit, we can pull a trick similar to that applied for its
+previsit, using the node type for computing an index into a virtual function
+table.
+
+<<postvisit>>=
+if (me->type == AST_CUR || me->type == AST_COMP 
+    || me->type == AST_PAIR) {
+  Visit(me, vp, me->type + 4);
+}
+@
+Not every one of a visitor's methods may be meaningful to a particular
+implementation. In these cases, we can use the default `action' of doing
+nothing. Note this leaves the method parameters unused, and we have inserted
+vacuous casts to [[void]] in order to silence compiler warnings.
+
+<<ast.c function definitions>>=
+statusCode_t
+VisitDefault(visit_t * const me, const ast_t *ap)
+{
+  (void)me;
+  (void)ap;
+  return SC_CONTINUE;
+}

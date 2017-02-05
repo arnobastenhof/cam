@@ -1,0 +1,374 @@
+\section{The parser}\label{section:parser}
+\subsection{Interface}
+With the lexer converting an input string of characters into a stream of
+tokens, the parser next attempts the recognition of structure, recording its
+observations in an AST. By keeping the parser stateless, its interface remains
+simple as well.
+
+<<parser.h>>=
+#ifndef PARSER_H_
+
+#include "ast.h"
+#include "lexer.h"
+
+extern ast_t *  Parse(lexer_t * const);
+
+#endif /* PARSER_H_ */
+
+@ \subsection{Implementation}
+We implement the parser using recursive-descent, meaning the call stack is used
+to trace a branch in the parse tree. Essentially, each grammar rule in Figure
+\ref{fig:ebnf} translates to a method, making this an easy technique to use for
+writing a parser by hand with.
+
+<<parser.c>>=
+#include "parser.h"
+
+#include <assert.h>
+#include <ctype.h>
+#include <setjmp.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "ast.h"
+#include "except.h"
+#include "lexer.h"
+#include "node.h"
+#include "pool.h"
+
+<<parser.c typedefs>>
+<<parser.c global variables>>
+<<parser.c function prototypes>>
+<<parser.c function definitions>>
+
+@ As we process a term we shall want to keep track of variable bindings. Recall
+that in De Bruijn's notation, names are replaced with numbers indicating their
+distance to the binding site. Thus, in translating a variable occurrence, we
+must navigate the parse tree back up to the root node, counting the $\lambda$'s
+seen on the way until a match is found (signalling an error otherwise). We can
+implement this process by maintaining a stack of variable names, corresponding
+to the bindings in the order that we encountered them. We speak interchangeably
+of a \emph{scope}, calling its individual nodes \emph{symbols}.
+
+<<parser.c typedefs>>=
+typedef struct {
+  node_t  base;
+  char    value[MAXTOK + 1];
+} symbol_t;
+
+@ Though the lifetimes of symbols are tied to the method invocations that
+record a branch of the parse tree in the call stack, the fact that we allowed
+multiple variables to be bound at once in our input language makes it
+impossible to know at compile time just how many symbols to allocate upon the
+processing of any given $\lambda$. As such, we store symbols in a memory pool.
+
+<<parser.c global variables>>=
+static symbol_t g_pool[N_ELEMS];
+pool_t          g_symbol_pool = INIT_POOL(g_pool, N_ELEMS, symbol_t);
+
+@ The process of allocating and initializing a new symbol and pushing it onto
+a scope will be repeated sufficiently often in what is to follow as to justify
+its encapsulation into a separate method.
+
+<<parser.c function definitions>>=
+static void
+PushNewSymbol(const symbol_t ** scope, const char * const token)
+{
+  symbol_t *  symbol;
+
+  assert(scope);
+  assert(token);
+
+  symbol = Pool_Alloc(&g_symbol_pool);
+  strcpy(symbol->value, token);
+  Push(scope, symbol);
+}
+
+@ With the exception of [[alpha]], each non-terminal from Figure \ref{fig:ebnf}
+has its own method. All return an AST, and most take an additional argument for
+the scope to resolve free variable occurences.
+<<parser.c function prototypes>>=
+static ast_t * ParseExpr(lexer_t * const, const symbol_t *);
+static ast_t * ParseVar(const char * const, const symbol_t * const);
+static ast_t * ParseNum(const char *);
+static ast_t * ParseSum(lexer_t * const, const symbol_t *);
+static ast_t * ParseApp(lexer_t * const, const symbol_t *);
+static ast_t * ParseAbs(lexer_t * const, const symbol_t *, int *);
+
+@ We use a number of helper methods for implementing the grammar rules. The
+first, [[Consume]], simply attempts to read the next token. If none is
+available, we print a message. In this case, as well as when the lexer reports
+an error, we give up parsing immediately and throw an exception.
+<<parser.c function definitions>>=
+static void
+Consume(lexer_t * const lexer)
+{
+  int cnt;
+
+  switch (cnt = Lexer_NextToken(lexer)) {
+  case 0:
+    fprintf(stderr, "Unexpected end of input.\n");
+    /* fall-through */
+  case -1:
+    THROW;
+  default:
+    return;
+  }
+}
+
+@ Next, [[Match]] allows to validate the type of the last consumed token,
+reporting an error and raising an exception in case of a mismatch.
+<<parser.c function definitions>>=
+static void
+Match(lexer_t * const lexer, const tokenType_t type)
+{
+  if (type != lexer->type) {
+    fprintf(stderr, "Unexpected token: %s.\n", lexer->token);
+    THROW;
+  }
+}
+
+@ As the last of our helper methods, we combine [[Consume]] and [[Match]] into
+a single function [[Expect]].
+
+<<parser.c function definitions>>=
+static inline void
+Expect(lexer_t * const lexer, const tokenType_t type)
+{
+  Consume(lexer);
+  Match(lexer, type);
+}
+
+@ To start parsing, we consume the first token and invoke the start symbol
+with an empty scope.
+
+<<parser.c function definitions>>=
+ast_t *
+Parse(lexer_t * const lexer)
+{
+  Consume(lexer);
+  return ParseExpr(lexer, NULL);
+}
+
+@ We start our implementation of the grammar rules with the start symbol.
+Recall an expression is a variable, a number, or an application.
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseExpr(lexer_t * const lexer, const symbol_t *scope)
+{
+  assert(lexer->type != LEX_NONE);
+
+  switch (lexer->type) {
+  case LEX_VAR:
+    return ParseVar(lexer->token, scope);
+  case LEX_NUM:
+    return ParseNum(lexer->token);
+  case LEX_LBRACK:
+    <<parse application>>
+  default:
+    fprintf(stderr, "Unexpected token: %s.\n", lexer->token);
+    THROW;
+  }
+}
+
+@ Whereas applications may be handled by a single production in the full
+$\lambda$-calculus, instead, in order to accommodate the restrictions discussed
+in \S\ref{section:syntax}, we have here had to split it up based on whether the
+operand coincides with [[+]] (cf. the rule for [[sum]]) or an abstraction
+([[app]]). To differentiate between the two cases, we will need to look ahead
+one extra token.
+
+<<parse application>>=
+Consume(lexer);
+if (lexer->type == LEX_PLUS) {
+  return ParseSum(lexer, scope);
+}
+return ParseApp(lexer, scope);
+@
+We already briefly explained the translation of variables. Given a scope, we
+count the symbols as we retrace our steps to the first that we saw. If a match
+is found, we convert the running count $n$ into a composition of projections,
+picking out the $n^{\rm th}$ term from the right in an environment. Else, if
+the variable is unbound, we print an error message and raise an exception.
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseVar(const char * const token, const symbol_t * const scope)
+{
+  ast_t *     ap;
+  symbol_t *  it;
+
+  assert(token);
+
+  if (IsEmpty(scope)) {
+    goto error;
+  }
+  ap = Ast_Node(AST_COMP);
+  Ast_AddChild(ap, Ast_Snd());
+  it = Link(scope);
+  do {
+    if (strcmp(token, it->value) == 0) {
+      return ap;
+    } else {
+      Ast_AddChild(ap, Ast_Fst());
+    }
+  } while ((it = Link(it)) != Link(scope));
+error:
+  fprintf(stderr, "Unbound variable: %s.\n", token);
+  THROW;
+}
+
+@ Numeric constants are simply returned quoted.
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseNum(const char *cp)
+{
+  int total = 0;
+
+  assert(isdigit(*cp));
+
+  do {
+    assert(isdigit(*cp));
+    total = (10 * total) + (*cp - '0');
+  } while (*++cp != '\0');
+  return Ast_Quote(total);
+}
+
+@ Figure \ref{fig:parser:sum} shows how to parse a sum [[(+ M1 ... Mn)]], where
+[[M1]], $\dots$, [[Mn]] are themselves expressions, proceeding by induction on
+$n$.
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseSum(lexer_t * const lexer, const symbol_t *scope)
+{
+  ast_t * root;
+
+  assert(lexer);
+  assert(lexer->type == LEX_PLUS);
+
+  Consume(lexer);
+  root = ParseExpr(lexer, scope);
+  Consume(lexer);
+  do {
+    root = Ast_Pair(root, ParseExpr(lexer, scope));
+    root = Ast_Pair(Ast_Plus(), root);
+    root = Ast_Comp(2, root, Ast_App());
+    Consume(lexer);
+  } while (lexer->type != LEX_RBRACK);
+
+  return root;
+}
+
+@ \begin{figure}
+\begin{center}
+\begin{tabular}{ccc}
+\Tree[.{$t_{k(>2)}\equiv\circ$ \ \ \ \ \ \ \ \ \ \ \ \ }
+     [.$\langle\cdot,\cdot\rangle$ 
+     [.$\Lambda$ [.$\circ$ \textit{Snd} '+ ] ]
+     [.$\langle\cdot,\cdot\rangle$ $t_{k-1}$ $s_k$ ] ]
+     \textit{App} ] & &
+\Tree[.{$t_2\equiv\circ$ \ \ \ \ \ \ \ }
+     [.$\langle\cdot,\cdot\rangle$ 
+     [.$\Lambda$ [.$\circ$ \textit{Snd} '+ ] ]
+     [.$\langle\cdot,\cdot\rangle$ $s_1$ $s_2$ ] ]
+     \textit{App} ]
+\end{tabular}
+\end{center}
+\caption{Mapping the input [[(+ M1 ... Mn)]] to an AST $t_n$, given trees
+$s_1,\dots,s_n$ for $M_1,\dots,M_n$.}
+\label{fig:parser:sum}
+\end{figure}
+
+@ In parsing an application whose operand is an abstraction, we want to make
+sure that the number of variables bound by the latter matches the number of
+operands. As we rather want the method for parsing abstractions to return an
+AST, just like the other methods implementing grammar rules, we communicate the
+number of bound variables through an [[int]] pointer that appears as an output
+parameter of [[ParseAbs]]. Assuming, then, that the abstraction takes the form
+[[(lambda (x1 ... xn) N)]] for some term [[N]], to be referred to by [[M0]],
+Figure \ref{fig:parser:app} then shows how to parse [[(M0 M1 ... Mn)]] into an
+AST, motivating the following code.
+\begin{figure}
+\begin{center}
+\Tree [.{$t_{k(>0)}\equiv\circ$ \ \ \ \ \ \ \ \ \ \ \ \ }
+      [.$\langle\cdot,\cdot\rangle$ $s_{k-1}$ $s_k$  ] 
+      \textit{App} ]
+\end{center}
+\caption{Mapping the input [[(M0 M1 ... Mn)]] to an AST $t_n$, given trees
+$s_0,\dots,s_n$ for $M_1,\dots,M_n$ and where $M_0$ is an abstraction.}
+\label{fig:parser:app}
+\end{figure}
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseApp(lexer_t * const lexer, const symbol_t *scope)
+{
+  ast_t * root;
+  int     cnt;
+
+  assert(lexer);
+
+  root = ParseAbs(lexer, scope, &cnt);
+  while (cnt-- > 0) {
+    Consume(lexer);
+    root = Ast_Pair(root, ParseExpr(lexer, scope));
+    root = Ast_Comp(2, root, Ast_App());
+  }
+  Expect(lexer, LEX_RBRACK);
+  return root;
+}
+
+@ The parsing of an abstraction [[(lambda (x1 ... xn) B)]] proceeds in three
+steps.
+
+<<parser.c function definitions>>=
+static ast_t *
+ParseAbs(lexer_t * const lexer, const symbol_t *scope, int *cnt)
+{
+  ast_t * ap;
+  int     i;
+
+  assert(lexer);
+
+  Match(lexer, LEX_LBRACK);
+  Expect(lexer, LEX_LAMBDA);
+  Expect(lexer, LEX_LBRACK);
+
+  <<parse variable list>>
+  <<parse body>>
+  <<construct AST>>
+
+  return ap;
+}
+@
+First, we push new symbols onto the scope as we read the parameter list
+[[x1]], $\dots$, [[xn]].
+
+<<parse variable list>>=
+Expect(lexer, LEX_VAR);
+PushNewSymbol(&scope, lexer->token);
+Consume(lexer);
+for (*cnt = 1; lexer->type != LEX_RBRACK; ++*cnt) {
+  Match(lexer, LEX_VAR);
+  PushNewSymbol(&scope, lexer->token);
+  Consume(lexer);
+}
+
+@ Next, the body [[N]] of the abstraction is parsed using the extended scope,
+returning some AST.
+
+<<parse body>>=
+Consume(lexer);
+ap = ParseExpr(lexer, scope);
+Expect(lexer, LEX_RBRACK);
+
+@ To obtain the AST for the abstraction as a whole, we add $n$ $\Lambda$-nodes.
+
+<<construct AST>>=
+for (i = *cnt; i > 0; --i) {
+  ap = Ast_Cur(ap);
+  Pool_Free(&g_symbol_pool, Pop(&scope));
+}
